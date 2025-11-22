@@ -1,0 +1,17 @@
+# Build directory
+Assets/
+Generated Files/
+packages/
+x64/
+WinvertApp/
+.vs/
+.vscode/
+
+# Binary and object files
+*.o
+*.obj
+*.bin
+*.elf
+*.hex
+*.pfx
+*.log
