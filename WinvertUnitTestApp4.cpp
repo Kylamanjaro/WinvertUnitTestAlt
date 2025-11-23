@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
+#include <cwchar>
 
 #include <winrt/Windows.Data.Json.h>
 
@@ -74,12 +76,78 @@ static DWORD LaunchWinvert4(std::wstring& outPfn)
     return pid;
 }
 
+static void SendKeyboardInput(WORD vk, DWORD flags = 0, DWORD extraSleepMs = 10)
+{
+    INPUT in{};
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.dwFlags = flags;
+    SendInput(1, &in, sizeof(INPUT));
+    if (extraSleepMs > 0) SleepMs(static_cast<int>(extraSleepMs));
+}
+
+static void SendHotkey(UINT modifiers, UINT vk)
+{
+    WORD modKeys[4]{};
+    int count = 0;
+    auto push = [&](WORD key) { modKeys[count++] = key; };
+    if (modifiers & MOD_WIN) push(VK_LWIN);
+    if (modifiers & MOD_CONTROL) push(VK_CONTROL);
+    if (modifiers & MOD_ALT) push(VK_MENU);
+    if (modifiers & MOD_SHIFT) push(VK_SHIFT);
+
+    for (int i = 0; i < count; ++i) SendKeyboardInput(modKeys[i]);
+    SendKeyboardInput(static_cast<WORD>(vk));
+    SendKeyboardInput(static_cast<WORD>(vk), KEYEVENTF_KEYUP);
+    for (int i = count - 1; i >= 0; --i) SendKeyboardInput(modKeys[i], KEYEVENTF_KEYUP);
+}
+
+static void TapKey(WORD vk)
+{
+    SendKeyboardInput(vk);
+    SendKeyboardInput(vk, KEYEVENTF_KEYUP);
+}
+
+static void LogMessage(const wchar_t* msg)
+{
+    Logger::WriteMessage(msg);
+}
+static void LogMessage(const std::wstring& msg)
+{
+    Logger::WriteMessage(msg.c_str());
+}
+
+static void TriggerInitialSelectionGesture()
+{
+    LogMessage(L"[Test] TriggerInitialSelectionGesture: Win+Shift+I");
+    SleepMs(2000);
+    SendHotkey(MOD_WIN | MOD_SHIFT, 'I');
+    SleepMs(750);
+    LogMessage(L"[Test] TriggerInitialSelectionGesture: selecting monitor 1");
+    TapKey('1');
+    SleepMs(750);
+}
+
+static std::wstring GetWindowTitle(HWND hwnd)
+{
+    if (!hwnd) return {};
+    int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) return {};
+    std::wstring title;
+    title.resize(len + 1);
+    int written = GetWindowTextW(hwnd, title.data(), len + 1);
+    if (written <= 0) return {};
+    title.resize(written);
+    return title;
+}
+
 static bool IsCandidateMainWindow(HWND hwnd)
 {
-    if (!IsWindowVisible(hwnd)) return false;
+    if (!IsWindow(hwnd)) return false;
     if (GetWindow(hwnd, GW_OWNER) != nullptr) return false;
     LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
     if (style & WS_DISABLED) return false;
+    if (!(style & (WS_CAPTION | WS_POPUP))) return false;
     return true;
 }
 
@@ -89,6 +157,7 @@ static HWND FindTopLevelWindowForPid(DWORD pid)
     {
         DWORD targetPid{};
         HWND found{};
+        HWND fallback{};
     } ctx{pid, nullptr};
 
     EnumWindows(
@@ -99,12 +168,50 @@ static HWND FindTopLevelWindowForPid(DWORD pid)
             GetWindowThreadProcessId(hwnd, &procId);
             if (procId != ctx->targetPid) return TRUE;
             if (!IsCandidateMainWindow(hwnd)) return TRUE;
-            ctx->found = hwnd;
-            return FALSE;
+
+            auto title = GetWindowTitle(hwnd);
+            if (!title.empty() && _wcsicmp(title.c_str(), L"Winvert Control Panel") == 0)
+            {
+                ctx->found = hwnd;
+                return FALSE;
+            }
+
+            if (!ctx->fallback)
+            {
+                ctx->fallback = hwnd;
+            }
+            return TRUE;
         },
         reinterpret_cast<LPARAM>(&ctx));
 
-    return ctx.found;
+    if (ctx.found) return ctx.found;
+    return ctx.fallback;
+}
+
+static HWND HwndFromElement(IUIAutomationElement* el)
+{
+    if (!el) return nullptr;
+    CComVariant v;
+    if (FAILED(el->GetCurrentPropertyValue(UIA_NativeWindowHandlePropertyId, &v))) return nullptr;
+    if (v.vt == VT_I4 || v.vt == VT_INT || v.vt == VT_UI4)
+    {
+        return reinterpret_cast<HWND>(static_cast<LONG_PTR>(v.lVal));
+    }
+    if (v.vt == VT_I8 || v.vt == VT_UI8)
+    {
+        return reinterpret_cast<HWND>(static_cast<LONG_PTR>(v.llVal));
+    }
+    return nullptr;
+}
+
+static void EnsureWindowVisible(IUIAutomationElement* el)
+{
+    if (!el) return;
+    if (HWND hwnd = HwndFromElement(el))
+    {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+    }
 }
 
 static CComPtr<IUIAutomationElement> FindMainWindowForPid(DWORD pid)
@@ -121,7 +228,7 @@ static CComPtr<IUIAutomationElement> FindMainWindowForPid(DWORD pid)
     CComPtr<IUIAutomationCondition> cond; uia->CreateAndCondition(pidCond, typeCond, &cond);
 
     CComPtr<IUIAutomationElement> win; root->FindFirst(TreeScope_Subtree, cond, &win);
-    if (win) return win;
+    if (win) { EnsureWindowVisible(win); return win; }
 
     // Fallback: enum top-level windows for the process and convert to UIA element.
     HWND hwnd = FindTopLevelWindowForPid(pid);
@@ -129,6 +236,7 @@ static CComPtr<IUIAutomationElement> FindMainWindowForPid(DWORD pid)
 
     CComPtr<IUIAutomationElement> fromHandle;
     if (FAILED(uia->ElementFromHandle(hwnd, &fromHandle))) return nullptr;
+    EnsureWindowVisible(fromHandle);
     return fromHandle;
 }
 
@@ -149,9 +257,152 @@ static CComPtr<IUIAutomationElement> FindByAutomationId(IUIAutomationElement* pa
     return el;
 }
 
-static bool Invoke(IUIAutomationElement* el)
+static CComPtr<IUIAutomationElement> WaitForAutomationId(IUIAutomationElement* parent, const wchar_t* aid, int timeoutMs = 5000, int pollMs = 100)
 {
-    if (!el) return false; CComPtr<IUIAutomationInvokePattern> pat; if (FAILED(el->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&pat)))) return false; return SUCCEEDED(pat->Invoke());
+    if (!parent) return nullptr;
+    {
+        std::wstring msg = L"[Test] WaitForAutomationId: looking for ";
+        msg += aid ? aid : L"(null)";
+        LogMessage(msg);
+    }
+    const int iterations = timeoutMs / pollMs;
+    for (int i = 0; i < iterations; ++i)
+    {
+        if (auto el = FindByAutomationId(parent, aid)) return el;
+        SleepMs(pollMs);
+    }
+    auto result = FindByAutomationId(parent, aid);
+    if (!result)
+    {
+        std::wstring msg = L"[Test] WaitForAutomationId: timed out for ";
+        msg += aid ? aid : L"(null)";
+        LogMessage(msg);
+    }
+    else
+    {
+        std::wstring msg = L"[Test] WaitForAutomationId: found after timeout ";
+        msg += aid ? aid : L"(null)";
+        LogMessage(msg);
+    }
+    return result;
+}
+
+static void DumpAutomationTree(IUIAutomationElement* root, int maxDepth = 6)
+{
+    if (!root)
+    {
+        LogMessage(L"[Test] DumpAutomationTree: root is null");
+        return;
+    }
+    CComPtr<IUIAutomation> uia;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+    {
+        LogMessage(L"[Test] DumpAutomationTree: failed to get UIA");
+        return;
+    }
+    CComPtr<IUIAutomationTreeWalker> walker;
+    if (FAILED(uia->get_ControlViewWalker(&walker)) || !walker)
+    {
+        LogMessage(L"[Test] DumpAutomationTree: failed to get walker");
+        return;
+    }
+
+    std::function<void(IUIAutomationElement*, int)> dump = [&](IUIAutomationElement* el, int depth)
+    {
+        if (!el || depth > maxDepth) return;
+        std::wstring indent(depth * 2, L' ');
+
+        CComVariant name, autoId, cls, ctrlType;
+        el->GetCurrentPropertyValue(UIA_NamePropertyId, &name);
+        el->GetCurrentPropertyValue(UIA_AutomationIdPropertyId, &autoId);
+        el->GetCurrentPropertyValue(UIA_ClassNamePropertyId, &cls);
+        el->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &ctrlType);
+
+        std::wstring line = indent + L"[Test] UIA: ";
+        if (name.vt == VT_BSTR) line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
+        if (autoId.vt == VT_BSTR) line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
+        if (cls.vt == VT_BSTR) line += L"class=" + std::wstring(cls.bstrVal) + L" ";
+        if (ctrlType.vt == VT_I4) line += L"type=" + std::to_wstring(ctrlType.lVal) + L" ";
+        LogMessage(line);
+
+        CComPtr<IUIAutomationElement> child;
+        walker->GetFirstChildElement(el, &child);
+        while (child)
+        {
+            dump(child, depth + 1);
+            CComPtr<IUIAutomationElement> next;
+            walker->GetNextSiblingElement(child, &next);
+            child = next;
+        }
+    };
+
+    LogMessage(L"[Test] DumpAutomationTree: start");
+    dump(root, 0);
+    LogMessage(L"[Test] DumpAutomationTree: end");
+}
+
+static bool ClickAtScreenPoint(LONG x, LONG y)
+{
+    if (!SetCursorPos(x, y)) return false;
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    return SendInput(2, inputs, sizeof(INPUT)) == 2;
+}
+
+static bool InvokeElement(IUIAutomationElement* el)
+{
+    if (!el) return false;
+
+    CComPtr<IUIAutomationInvokePattern> pat;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&pat))))
+    {
+        LogMessage(L"[Test] InvokeElement: using InvokePattern");
+        if (SUCCEEDED(pat->Invoke()))
+        {
+            LogMessage(L"[Test] InvokeElement: InvokePattern succeeded");
+            return true;
+        }
+        SleepMs(250);
+        if (SUCCEEDED(pat->Invoke()))
+        {
+            LogMessage(L"[Test] InvokeElement: InvokePattern succeeded after retry");
+            return true;
+        }
+        LogMessage(L"[Test] InvokeElement: InvokePattern failed");
+    }
+
+    POINT pt{};
+    BOOL got = FALSE;
+    if (SUCCEEDED(el->GetClickablePoint(&pt, &got)) && got)
+    {
+        LogMessage(L"[Test] InvokeElement: clicking clickable point");
+        if (ClickAtScreenPoint(pt.x, pt.y))
+        {
+            LogMessage(L"[Test] InvokeElement: clickable point click succeeded");
+            return true;
+        }
+        LogMessage(L"[Test] InvokeElement: clickable point click failed");
+    }
+
+    RECT r{};
+    if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r)))
+    {
+        LogMessage(L"[Test] InvokeElement: clicking bounding rectangle center");
+        LONG cx = (r.left + r.right) / 2;
+        LONG cy = (r.top + r.bottom) / 2;
+        if (ClickAtScreenPoint(cx, cy))
+        {
+            LogMessage(L"[Test] InvokeElement: bounding rectangle click succeeded");
+            return true;
+        }
+        LogMessage(L"[Test] InvokeElement: bounding rectangle click failed");
+    }
+
+    LogMessage(L"[Test] InvokeElement: all methods failed");
+    return false;
 }
 static bool Toggle(IUIAutomationElement* el, ToggleState desired)
 {
@@ -199,6 +450,8 @@ namespace WinvertUnitTestApp4
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
             // 1) Launch app with no save file (defaults)
+            // Enable test hook so Winvert opens Settings on launch instead of hiding the control panel.
+            SetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", L"1");
             std::wstring pfn; DWORD pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
             std::wstring localState = LocalStatePathForPFN(pfn);
@@ -208,23 +461,27 @@ namespace WinvertUnitTestApp4
             std::wstring settingsPath = localState + L"\\settings.json";
             if (fs::exists(settingsPath)) fs::remove(settingsPath);
 
+            LogMessage(L"[Test] Waiting for app to finish startup before triggering selection");
+            SleepMs(3000);
             // Find main window
             CComPtr<IUIAutomationElement> win;
             for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found");
+            LogMessage(L"[Test] Main window located, dumping automation tree");
+            DumpAutomationTree(win, 3);
 
             // Open settings
-            auto settingsBtn = FindByAutomationId(win, L"SettingsButton");
-            Assert::IsTrue(Invoke(settingsBtn), L"Failed to click SettingsButton");
+            auto settingsBtn = WaitForAutomationId(win, L"SettingsButton");
+            Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton");
             SleepMs(500);
 
             // Validate defaults
-            auto fps = FindByAutomationId(win, L"ShowFpsToggle");
-            auto sel = FindByAutomationId(win, L"SelectionColorEnableToggle");
-            auto nbDelay = FindByAutomationId(win, L"BrightnessDelayNumberBox");
-            auto nbR = FindByAutomationId(win, L"LumaRNumberBox");
-            auto nbG = FindByAutomationId(win, L"LumaGNumberBox");
-            auto nbB = FindByAutomationId(win, L"LumaBNumberBox");
+            auto fps = WaitForAutomationId(win, L"ShowFpsToggle");
+            auto sel = WaitForAutomationId(win, L"SelectionColorEnableToggle");
+            auto nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox");
+            auto nbR = WaitForAutomationId(win, L"LumaRNumberBox");
+            auto nbG = WaitForAutomationId(win, L"LumaGNumberBox");
+            auto nbB = WaitForAutomationId(win, L"LumaBNumberBox");
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing");
 
             // 2) Change settings via UI
@@ -236,7 +493,7 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(SetValue(nbB, L"0.11"), L"Set luma B failed");
 
             // Add a color map (best-effort; if control exists)
-            if (auto add = FindByAutomationId(win, L"ColorMapAddButton")) { Invoke(add); SleepMs(200); }
+            if (auto add = FindByAutomationId(win, L"ColorMapAddButton")) { InvokeElement(add); SleepMs(200); }
 
             // Close app (saving should occur on interactions)
             CloseWindow(win);
@@ -253,13 +510,17 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(JsonEqualWithTolerance(expected, settingsPath), L"Saved settings.json does not match expected");
 
             // 4) Relaunch and verify UI reflects settings
+            SetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", L"1");
             pfn.clear(); pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to relaunch Winvert4");
+            LogMessage(L"[Test] Waiting for app to finish startup (relaunch)");
+            SleepMs(2000);
             win = nullptr; for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found (relaunch)");
-            settingsBtn = FindByAutomationId(win, L"SettingsButton"); Invoke(settingsBtn); SleepMs(500);
+            LogMessage(L"[Test] Main window located after relaunch, dumping automation tree");
+            DumpAutomationTree(win, 3);
 
-            fps = FindByAutomationId(win, L"ShowFpsToggle"); sel = FindByAutomationId(win, L"SelectionColorEnableToggle"); nbDelay = FindByAutomationId(win, L"BrightnessDelayNumberBox"); nbR = FindByAutomationId(win, L"LumaRNumberBox"); nbG = FindByAutomationId(win, L"LumaGNumberBox"); nbB = FindByAutomationId(win, L"LumaBNumberBox");
+            fps = WaitForAutomationId(win, L"ShowFpsToggle"); sel = WaitForAutomationId(win, L"SelectionColorEnableToggle"); nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox"); nbR = WaitForAutomationId(win, L"LumaRNumberBox"); nbG = WaitForAutomationId(win, L"LumaGNumberBox"); nbB = WaitForAutomationId(win, L"LumaBNumberBox");
             // We don't read back ToggleState/Value here due to brevity; presence is a smoke test. Extend as needed.
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing on relaunch");
 
