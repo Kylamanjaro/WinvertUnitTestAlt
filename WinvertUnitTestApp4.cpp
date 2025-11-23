@@ -319,9 +319,12 @@ static void DumpAutomationTree(IUIAutomationElement* root, int maxDepth = 6)
         el->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &ctrlType);
 
         std::wstring line = indent + L"[Test] UIA: ";
-        if (name.vt == VT_BSTR) line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
-        if (autoId.vt == VT_BSTR) line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
-        if (cls.vt == VT_BSTR) line += L"class=" + std::wstring(cls.bstrVal) + L" ";
+        if (name.vt == VT_BSTR && name.bstrVal)
+            line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
+        if (autoId.vt == VT_BSTR && autoId.bstrVal)
+            line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
+        if (cls.vt == VT_BSTR && cls.bstrVal)
+            line += L"class=" + std::wstring(cls.bstrVal) + L" ";
         if (ctrlType.vt == VT_I4) line += L"type=" + std::to_wstring(ctrlType.lVal) + L" ";
         LogMessage(line);
 
@@ -389,11 +392,53 @@ static void DumpAllAutomationElements(IUIAutomationElement* root)
 
         std::wstring line = L"[Test] ALL: ";
         line += L"#" + std::to_wstring(i) + L" ";
-        if (name.vt == VT_BSTR)    line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
-        if (autoId.vt == VT_BSTR)  line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
-        if (cls.vt == VT_BSTR)     line += L"class=" + std::wstring(cls.bstrVal) + L" ";
+        if (name.vt == VT_BSTR && name.bstrVal)
+            line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
+        if (autoId.vt == VT_BSTR && autoId.bstrVal)
+            line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
+        if (cls.vt == VT_BSTR && cls.bstrVal)
+            line += L"class=" + std::wstring(cls.bstrVal) + L" ";
         if (ctrlType.vt == VT_I4)  line += L"type=" + std::to_wstring(ctrlType.lVal) + L" ";
         LogMessage(line);
+    }
+}
+
+static bool InvokeElement(IUIAutomationElement* el);
+
+static void ExpandAllSettingsExpanders(IUIAutomationElement* root)
+{
+    if (!root) return;
+    const wchar_t* kExpanders[] =
+    {
+        L"SelectionColorExpander",
+        L"BrightnessExpander",
+        L"HotkeysExpander",
+        L"CustomFiltersExpander",
+        L"ColorMappingExpander"
+    };
+
+    for (auto id : kExpanders)
+    {
+        auto expander = FindByAutomationId(root, id);
+        if (!expander) continue;
+
+        CComPtr<IUIAutomationExpandCollapsePattern> pat;
+        if (SUCCEEDED(expander->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&pat))) && pat)
+        {
+            ExpandCollapseState state{};
+            if (SUCCEEDED(pat->get_CurrentExpandCollapseState(&state)) &&
+                (state == ExpandCollapseState_Collapsed || state == ExpandCollapseState_PartiallyExpanded))
+            {
+                pat->Expand();
+                SleepMs(200);
+            }
+        }
+        else
+        {
+            // Fallback: try invoke if no expand/collapse pattern is exposed
+            InvokeElement(expander);
+            SleepMs(200);
+        }
     }
 }
 
@@ -544,6 +589,13 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(settingsBtn != nullptr, L"SettingsButton not found");
             Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton");
             SleepMs(750);
+
+            // Expand all settings expanders so nested controls are realized in the tree.
+            LogMessage(L"[Test] Expanding all settings expanders");
+            ExpandAllSettingsExpanders(win);
+
+            LogMessage(L"[Test] Dumping elements after opening Settings");
+            DumpAllAutomationElements(win);
 
             // 2) Change settings via UI (Settings panel now open)
             auto fps = WaitForAutomationId(win, L"ShowFpsToggle");
