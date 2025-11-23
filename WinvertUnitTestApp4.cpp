@@ -541,6 +541,19 @@ static bool JsonEqualWithTolerance(const std::wstring& expectedPath, const std::
     return true;
 }
 
+struct AppCloser
+{
+    CComPtr<IUIAutomationElement> win;
+    bool closed{ false };
+    ~AppCloser()
+    {
+        if (win && !closed)
+        {
+            CloseWindow(win);
+        }
+    }
+};
+
 namespace WinvertUnitTestApp4
 {
     TEST_CLASS(EndToEndTests)
@@ -549,6 +562,7 @@ namespace WinvertUnitTestApp4
         TEST_METHOD(EndToEnd_SettingsPersist)
         {
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            AppCloser closer;
 
             // 1) Launch app with no save file (defaults)
             // Log current test flag state before we change anything.
@@ -576,6 +590,7 @@ namespace WinvertUnitTestApp4
             // Ensure no save file to start
             std::wstring settingsPath = localState + L"\\settings.json";
             if (fs::exists(settingsPath)) fs::remove(settingsPath);
+            LogMessage(std::wstring(L"[Test] settingsPath=") + settingsPath);
 
             LogMessage(L"[Test] Waiting for app to finish startup");
             SleepMs(3000);
@@ -584,6 +599,7 @@ namespace WinvertUnitTestApp4
             CComPtr<IUIAutomationElement> win;
             for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found");
+            closer.win = win;
             // Open settings via the visible SettingsButton in the tab strip footer.
             auto settingsBtn = WaitForAutomationId(win, L"SettingsButton");
             Assert::IsTrue(settingsBtn != nullptr, L"SettingsButton not found");
@@ -618,6 +634,7 @@ namespace WinvertUnitTestApp4
 
             // Close app (saving should occur on interactions)
             CloseWindow(win);
+            closer.closed = true;
             SleepMs(1000);
 
             // 3) Compare settings.json to expected golden
@@ -637,6 +654,7 @@ namespace WinvertUnitTestApp4
             SleepMs(2000);
             win = nullptr; for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found (relaunch)");
+            closer.win = win;
             LogMessage(L"[Test] Main window located after relaunch; opening Settings");
 
             settingsBtn = WaitForAutomationId(win, L"SettingsButton");
@@ -653,6 +671,7 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing on relaunch");
 
             CloseWindow(win);
+            closer.closed = true;
         }
     };
 }

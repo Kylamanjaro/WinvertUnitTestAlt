@@ -1,0 +1,38 @@
+{
+    "version": 1,
+    "toggles": {
+        "showFps": true,
+        "selectionColorEnabled": false,
+        "colorMapPreserve": true
+    },
+    "selectionColor": {
+        "r": 255,
+        "g": 0,
+        "b": 0
+    },
+    "brightness": {
+        "delayFrames": 0,
+        "lumaWeights": [
+            0.2125999927520752,
+            0.71520000696182251,
+            0.0722000002861023
+        ]
+    },
+    "hotkeys": {
+        "invert": {
+            "mod": 12,
+            "vk": 73
+        },
+        "filter": {
+            "mod": 12,
+            "vk": 70
+        },
+        "remove": {
+            "mod": 12,
+            "vk": 82
+        }
+    },
+    "favoriteFilterIndex": 0,
+    "savedFilters": [],
+    "colorMaps": []
+}
