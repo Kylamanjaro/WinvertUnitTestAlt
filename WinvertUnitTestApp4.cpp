@@ -450,7 +450,22 @@ namespace WinvertUnitTestApp4
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
             // 1) Launch app with no save file (defaults)
-            // Enable test hook so Winvert opens Settings on launch instead of hiding the control panel.
+            // Log current test flag state before we change anything.
+            {
+                wchar_t buf[32] = { 0 };
+                DWORD n = GetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", buf, (DWORD)std::size(buf));
+                if (n == 0)
+                {
+                    LogMessage(L"[Test] WINVERT_TEST_OPEN_SETTINGS is not set in test process");
+                }
+                else
+                {
+                    std::wstring v(buf, buf + wcsnlen_s(buf, std::size(buf)));
+                    LogMessage(L"[Test] WINVERT_TEST_OPEN_SETTINGS (initial) = " + v);
+                }
+            }
+
+            // Enable test hook so Winvert keeps the control panel visible and opens Settings on launch.
             SetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", L"1");
             std::wstring pfn; DWORD pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
@@ -461,29 +476,16 @@ namespace WinvertUnitTestApp4
             std::wstring settingsPath = localState + L"\\settings.json";
             if (fs::exists(settingsPath)) fs::remove(settingsPath);
 
-            LogMessage(L"[Test] Waiting for app to finish startup before triggering selection");
+            LogMessage(L"[Test] Waiting for app to finish startup");
             SleepMs(3000);
+
             // Find main window
             CComPtr<IUIAutomationElement> win;
             for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found");
-            LogMessage(L"[Test] Main window located, dumping automation tree");
-            DumpAutomationTree(win, 3);
+            LogMessage(L"[Test] Main window located, Settings should be open");
 
-            // Open settings by clicking in the top-right area of the tab strip footer.
-            // The Settings gear button isn't exposed via UIA, so approximate its location
-            // relative to the RegionsTabView bounds.
-            auto tabView = WaitForAutomationId(win, L"RegionsTabView");
-            Assert::IsTrue(tabView != nullptr, L"RegionsTabView not found");
-            RECT tabRect{};
-            Assert::IsTrue(SUCCEEDED(tabView->get_CurrentBoundingRectangle(&tabRect)), L"Failed to get RegionsTabView bounds");
-            LONG clickX = tabRect.right - 20;  // near right edge
-            LONG clickY = tabRect.top + 20;    // near top (tab strip area)
-            LogMessage(L"[Test] Clicking near tab strip footer to open Settings");
-            Assert::IsTrue(ClickAtScreenPoint(clickX, clickY), L"Failed to synthesize click for Settings");
-            SleepMs(750);
-
-            // Validate defaults
+            // 2) Change settings via UI (Settings panel is already open in test mode)
             auto fps = WaitForAutomationId(win, L"ShowFpsToggle");
             auto sel = WaitForAutomationId(win, L"SelectionColorEnableToggle");
             auto nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox");
@@ -492,7 +494,6 @@ namespace WinvertUnitTestApp4
             auto nbB = WaitForAutomationId(win, L"LumaBNumberBox");
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing");
 
-            // 2) Change settings via UI
             Assert::IsTrue(Toggle(fps, ToggleState_On), L"Toggle ShowFps ON failed");
             Assert::IsTrue(Toggle(sel, ToggleState_On), L"Toggle SelectionColor ON failed");
             Assert::IsTrue(SetValue(nbDelay, L"7"), L"Set delay failed");
@@ -517,7 +518,7 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(fs::exists(settingsPath), L"settings.json was not created");
             Assert::IsTrue(JsonEqualWithTolerance(expected, settingsPath), L"Saved settings.json does not match expected");
 
-            // 4) Relaunch and verify UI reflects settings
+            // 4) Relaunch and verify UI reflects settings (smoke: controls present)
             SetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", L"1");
             pfn.clear(); pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to relaunch Winvert4");
@@ -525,11 +526,14 @@ namespace WinvertUnitTestApp4
             SleepMs(2000);
             win = nullptr; for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found (relaunch)");
-            LogMessage(L"[Test] Main window located after relaunch, dumping automation tree");
-            DumpAutomationTree(win, 3);
+            LogMessage(L"[Test] Main window located after relaunch, Settings should be open");
 
-            fps = WaitForAutomationId(win, L"ShowFpsToggle"); sel = WaitForAutomationId(win, L"SelectionColorEnableToggle"); nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox"); nbR = WaitForAutomationId(win, L"LumaRNumberBox"); nbG = WaitForAutomationId(win, L"LumaGNumberBox"); nbB = WaitForAutomationId(win, L"LumaBNumberBox");
-            // We don't read back ToggleState/Value here due to brevity; presence is a smoke test. Extend as needed.
+            fps = WaitForAutomationId(win, L"ShowFpsToggle");
+            sel = WaitForAutomationId(win, L"SelectionColorEnableToggle");
+            nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox");
+            nbR = WaitForAutomationId(win, L"LumaRNumberBox");
+            nbG = WaitForAutomationId(win, L"LumaGNumberBox");
+            nbB = WaitForAutomationId(win, L"LumaBNumberBox");
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing on relaunch");
 
             CloseWindow(win);
