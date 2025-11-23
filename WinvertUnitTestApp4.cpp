@@ -59,13 +59,17 @@ static std::string ReadAllUtf8(const std::wstring& path)
 static DWORD LaunchWinvert4(std::wstring& outPfn)
 {
     CComPtr<IApplicationActivationManager> aam;
-    HRESULT hr = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&aam));
+    HRESULT hr = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&aam));
     if (FAILED(hr)) return 0;
+
+    constexpr wchar_t kWinvert4Aumid[] =
+        L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90_ft4zefc91v2gy!App"; // <- your actual value
+
     DWORD pid = 0;
-    // AUMID = Identity Name + "!" + App Id
-    // Identity Name is in Winvert4\\Package.appxmanifest (b27d31cf-c66d-45ac-aad0-e0d9501a1c90), App Id is "App"
-    hr = aam->ActivateApplication(L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90!App", nullptr, AO_NONE, &pid);
+    hr = aam->ActivateApplication(kWinvert4Aumid, nullptr, AO_NONE, &pid);
     if (FAILED(hr) || pid == 0) return 0;
+
     outPfn = PFNForProcess(pid);
     return pid;
 }
@@ -207,7 +211,6 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(fps && sel && nbDelay && nbR && nbG && nbB, L"Settings controls missing on relaunch");
 
             CloseWindow(win);
-            CoUninitialize();
         }
     };
 }
