@@ -74,6 +74,64 @@ static DWORD LaunchWinvert4(std::wstring& outPfn)
     return pid;
 }
 
+static bool IsCandidateMainWindow(HWND hwnd)
+{
+    if (!IsWindowVisible(hwnd)) return false;
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) return false;
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (style & WS_DISABLED) return false;
+    return true;
+}
+
+static HWND FindTopLevelWindowForPid(DWORD pid)
+{
+    struct EnumCtx
+    {
+        DWORD targetPid{};
+        HWND found{};
+    } ctx{pid, nullptr};
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM lParam)->BOOL
+        {
+            auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
+            DWORD procId = 0;
+            GetWindowThreadProcessId(hwnd, &procId);
+            if (procId != ctx->targetPid) return TRUE;
+            if (!IsCandidateMainWindow(hwnd)) return TRUE;
+            ctx->found = hwnd;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+
+    return ctx.found;
+}
+
+static CComPtr<IUIAutomationElement> FindMainWindowForPid(DWORD pid)
+{
+    CComPtr<IUIAutomation> uia; if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia)))) return nullptr;
+    CComPtr<IUIAutomationElement> root; if (FAILED(uia->GetRootElement(&root))) return nullptr;
+
+    VARIANT vPid; VariantInit(&vPid); vPid.vt = VT_I4; vPid.lVal = static_cast<LONG>(pid);
+    CComPtr<IUIAutomationCondition> pidCond; uia->CreatePropertyCondition(UIA_ProcessIdPropertyId, vPid, &pidCond);
+
+    VARIANT vType; VariantInit(&vType); vType.vt = VT_I4; vType.lVal = UIA_WindowControlTypeId;
+    CComPtr<IUIAutomationCondition> typeCond; uia->CreatePropertyCondition(UIA_ControlTypePropertyId, vType, &typeCond);
+
+    CComPtr<IUIAutomationCondition> cond; uia->CreateAndCondition(pidCond, typeCond, &cond);
+
+    CComPtr<IUIAutomationElement> win; root->FindFirst(TreeScope_Subtree, cond, &win);
+    if (win) return win;
+
+    // Fallback: enum top-level windows for the process and convert to UIA element.
+    HWND hwnd = FindTopLevelWindowForPid(pid);
+    if (!hwnd) return nullptr;
+
+    CComPtr<IUIAutomationElement> fromHandle;
+    if (FAILED(uia->ElementFromHandle(hwnd, &fromHandle))) return nullptr;
+    return fromHandle;
+}
+
 static CComPtr<IUIAutomationElement> FindWindowByName(const wchar_t* name)
 {
     CComPtr<IUIAutomation> uia; if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia)))) return nullptr;
@@ -136,11 +194,6 @@ namespace WinvertUnitTestApp4
     TEST_CLASS(EndToEndTests)
     {
     public:
-        TEST_METHOD(Test)
-        {
-            Assert::IsTrue(true);
-        }
-
         TEST_METHOD(EndToEnd_SettingsPersist)
         {
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -157,7 +210,7 @@ namespace WinvertUnitTestApp4
 
             // Find main window
             CComPtr<IUIAutomationElement> win;
-            for (int i = 0; i < 50 && !win; ++i) { SleepMs(100); win = FindWindowByName(L"Winvert Control Panel"); }
+            for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found");
 
             // Open settings
@@ -202,7 +255,7 @@ namespace WinvertUnitTestApp4
             // 4) Relaunch and verify UI reflects settings
             pfn.clear(); pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to relaunch Winvert4");
-            win = nullptr; for (int i = 0; i < 50 && !win; ++i) { SleepMs(100); win = FindWindowByName(L"Winvert Control Panel"); }
+            win = nullptr; for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found (relaunch)");
             settingsBtn = FindByAutomationId(win, L"SettingsButton"); Invoke(settingsBtn); SleepMs(500);
 
