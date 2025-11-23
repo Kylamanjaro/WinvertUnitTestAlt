@@ -470,10 +470,18 @@ namespace WinvertUnitTestApp4
             LogMessage(L"[Test] Main window located, dumping automation tree");
             DumpAutomationTree(win, 3);
 
-            // Open settings
-            auto settingsBtn = WaitForAutomationId(win, L"SettingsButton");
-            Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton");
-            SleepMs(500);
+            // Open settings by clicking in the top-right area of the tab strip footer.
+            // The Settings gear button isn't exposed via UIA, so approximate its location
+            // relative to the RegionsTabView bounds.
+            auto tabView = WaitForAutomationId(win, L"RegionsTabView");
+            Assert::IsTrue(tabView != nullptr, L"RegionsTabView not found");
+            RECT tabRect{};
+            Assert::IsTrue(SUCCEEDED(tabView->get_CurrentBoundingRectangle(&tabRect)), L"Failed to get RegionsTabView bounds");
+            LONG clickX = tabRect.right - 20;  // near right edge
+            LONG clickY = tabRect.top + 20;    // near top (tab strip area)
+            LogMessage(L"[Test] Clicking near tab strip footer to open Settings");
+            Assert::IsTrue(ClickAtScreenPoint(clickX, clickY), L"Failed to synthesize click for Settings");
+            SleepMs(750);
 
             // Validate defaults
             auto fps = WaitForAutomationId(win, L"ShowFpsToggle");
