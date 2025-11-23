@@ -341,6 +341,62 @@ static void DumpAutomationTree(IUIAutomationElement* root, int maxDepth = 6)
     LogMessage(L"[Test] DumpAutomationTree: end");
 }
 
+static void DumpAllAutomationElements(IUIAutomationElement* root)
+{
+    if (!root)
+    {
+        LogMessage(L"[Test] DumpAllAutomationElements: root is null");
+        return;
+    }
+
+    CComPtr<IUIAutomation> uia;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+    {
+        LogMessage(L"[Test] DumpAllAutomationElements: failed to create UIA");
+        return;
+    }
+
+    CComPtr<IUIAutomationCondition> cond;
+    if (FAILED(uia->CreateTrueCondition(&cond)) || !cond)
+    {
+        LogMessage(L"[Test] DumpAllAutomationElements: failed to create TrueCondition");
+        return;
+    }
+
+    CComPtr<IUIAutomationElementArray> arr;
+    if (FAILED(root->FindAll(TreeScope_Subtree, cond, &arr)) || !arr)
+    {
+        LogMessage(L"[Test] DumpAllAutomationElements: FindAll failed");
+        return;
+    }
+
+    int length = 0;
+    arr->get_Length(&length);
+
+    std::wstring header = L"[Test] DumpAllAutomationElements: count=" + std::to_wstring(length);
+    LogMessage(header);
+
+    for (int i = 0; i < length; ++i)
+    {
+        CComPtr<IUIAutomationElement> el;
+        if (FAILED(arr->GetElement(i, &el)) || !el) continue;
+
+        CComVariant name, autoId, cls, ctrlType;
+        el->GetCurrentPropertyValue(UIA_NamePropertyId, &name);
+        el->GetCurrentPropertyValue(UIA_AutomationIdPropertyId, &autoId);
+        el->GetCurrentPropertyValue(UIA_ClassNamePropertyId, &cls);
+        el->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &ctrlType);
+
+        std::wstring line = L"[Test] ALL: ";
+        line += L"#" + std::to_wstring(i) + L" ";
+        if (name.vt == VT_BSTR)    line += L"name=\"" + std::wstring(name.bstrVal) + L"\" ";
+        if (autoId.vt == VT_BSTR)  line += L"id=" + std::wstring(autoId.bstrVal) + L" ";
+        if (cls.vt == VT_BSTR)     line += L"class=" + std::wstring(cls.bstrVal) + L" ";
+        if (ctrlType.vt == VT_I4)  line += L"type=" + std::to_wstring(ctrlType.lVal) + L" ";
+        LogMessage(line);
+    }
+}
+
 static bool ClickAtScreenPoint(LONG x, LONG y)
 {
     if (!SetCursorPos(x, y)) return false;
@@ -483,9 +539,13 @@ namespace WinvertUnitTestApp4
             CComPtr<IUIAutomationElement> win;
             for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found");
-            LogMessage(L"[Test] Main window located, Settings should be open");
+            // Open settings via the visible SettingsButton in the tab strip footer.
+            auto settingsBtn = WaitForAutomationId(win, L"SettingsButton");
+            Assert::IsTrue(settingsBtn != nullptr, L"SettingsButton not found");
+            Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton");
+            SleepMs(750);
 
-            // 2) Change settings via UI (Settings panel is already open in test mode)
+            // 2) Change settings via UI (Settings panel now open)
             auto fps = WaitForAutomationId(win, L"ShowFpsToggle");
             auto sel = WaitForAutomationId(win, L"SelectionColorEnableToggle");
             auto nbDelay = WaitForAutomationId(win, L"BrightnessDelayNumberBox");
@@ -519,14 +579,18 @@ namespace WinvertUnitTestApp4
             Assert::IsTrue(JsonEqualWithTolerance(expected, settingsPath), L"Saved settings.json does not match expected");
 
             // 4) Relaunch and verify UI reflects settings (smoke: controls present)
-            SetEnvironmentVariableW(L"WINVERT_TEST_OPEN_SETTINGS", L"1");
             pfn.clear(); pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to relaunch Winvert4");
             LogMessage(L"[Test] Waiting for app to finish startup (relaunch)");
             SleepMs(2000);
             win = nullptr; for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
             Assert::IsTrue(win != nullptr, L"Main window not found (relaunch)");
-            LogMessage(L"[Test] Main window located after relaunch, Settings should be open");
+            LogMessage(L"[Test] Main window located after relaunch; opening Settings");
+
+            settingsBtn = WaitForAutomationId(win, L"SettingsButton");
+            Assert::IsTrue(settingsBtn != nullptr, L"SettingsButton not found (relaunch)");
+            Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton (relaunch)");
+            SleepMs(750);
 
             fps = WaitForAutomationId(win, L"ShowFpsToggle");
             sel = WaitForAutomationId(win, L"SelectionColorEnableToggle");
