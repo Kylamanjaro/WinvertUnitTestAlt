@@ -13,6 +13,12 @@
 #include <filesystem>
 #include <cmath>
 #include <sstream>
+#include <unordered_map>
+#include <cstdint>
+
+#include <winrt/base.h>
+#include <winrt/Windows.Data.Json.h>
+#pragma comment(lib, "windowsapp.lib")
 
 #include "CppUnitTest.h"
 using namespace Microsoft::VisualStudio::CppUnitTestFramework;
@@ -199,52 +205,6 @@ static CComPtr<IUIAutomationElement> FindByAutomationId(IUIAutomationElement* pa
     return el;
 }
 
-static CComPtr<IUIAutomationElement> FindByAutomationIdAndName(
-    IUIAutomationElement* parent,
-    const wchar_t* aid,
-    const wchar_t* name)
-{
-    if (!parent) return nullptr;
-
-    CComPtr<IUIAutomation> uia;
-    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
-        return nullptr;
-
-    CComPtr<IUIAutomationCondition> idCond;
-    CComPtr<IUIAutomationCondition> nameCond;
-    CComPtr<IUIAutomationCondition> combined;
-
-    if (aid && *aid)
-    {
-        uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, CComVariant(aid), &idCond);
-    }
-    if (name && *name)
-    {
-        uia->CreatePropertyCondition(UIA_NamePropertyId, CComVariant(name), &nameCond);
-    }
-
-    if (idCond && nameCond)
-    {
-        uia->CreateAndCondition(idCond, nameCond, &combined);
-    }
-    else if (idCond)
-    {
-        combined = idCond;
-    }
-    else if (nameCond)
-    {
-        combined = nameCond;
-    }
-    else
-    {
-        return nullptr;
-    }
-
-    CComPtr<IUIAutomationElement> el;
-    parent->FindFirst(TreeScope_Subtree, combined, &el);
-    return el;
-}
-
 static CComPtr<IUIAutomationElement> FindByAutomationIdNameClass(
     IUIAutomationElement* parent,
     const wchar_t* aid,
@@ -298,23 +258,6 @@ static CComPtr<IUIAutomationElement> WaitForAutomationId(IUIAutomationElement* p
         SleepMs(pollMs);
     }
     return FindByAutomationId(parent, aid);
-}
-
-static CComPtr<IUIAutomationElement> WaitForAutomationIdAndName(
-    IUIAutomationElement* parent,
-    const wchar_t* aid,
-    const wchar_t* name,
-    int timeoutMs = 5000,
-    int pollMs = 100)
-{
-    if (!parent) return nullptr;
-    int iterations = timeoutMs / pollMs;
-    for (int i = 0; i < iterations; ++i)
-    {
-        if (auto el = FindByAutomationIdAndName(parent, aid, name)) return el;
-        SleepMs(pollMs);
-    }
-    return FindByAutomationIdAndName(parent, aid, name);
 }
 
 static CComPtr<IUIAutomationElement> WaitForAutomationIdNameClass(
@@ -497,62 +440,152 @@ static std::string ReadAllUtf8(const std::wstring& path)
     return s;
 }
 
+// Simple CRC32 for quick equality check
+static uint32_t Crc32(const uint8_t* data, size_t len)
+{
+    static uint32_t table[256];
+    static bool init = false;
+    if (!init)
+    {
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j)
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        init = true;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i)
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void FlattenJsonValueWinRT(
+    winrt::Windows::Data::Json::IJsonValue const& value,
+    const std::wstring& path,
+    std::unordered_map<std::wstring, std::wstring>& out)
+{
+    using namespace winrt::Windows::Data::Json;
+
+    switch (value.ValueType())
+    {
+    case JsonValueType::Object:
+    {
+        JsonObject obj = value.GetObject();
+        for (auto const& kvp : obj)
+        {
+            std::wstring key = kvp.Key().c_str();
+            std::wstring childPath = path.empty() ? key : (path + L"." + key);
+            FlattenJsonValueWinRT(kvp.Value(), childPath, out);
+        }
+        break;
+    }
+    case JsonValueType::Array:
+    {
+        JsonArray arr = value.GetArray();
+        for (uint32_t i = 0; i < arr.Size(); ++i)
+        {
+            std::wstring childPath = path + L"[" + std::to_wstring(i) + L"]";
+            FlattenJsonValueWinRT(arr.GetAt(i), childPath, out);
+        }
+        break;
+    }
+    case JsonValueType::Null:
+    case JsonValueType::Boolean:
+    case JsonValueType::Number:
+    case JsonValueType::String:
+    default:
+    {
+        if (!path.empty())
+        {
+            std::wstring v = value.Stringify().c_str();
+            out[path] = v;
+        }
+        break;
+    }
+    }
+}
+
 static bool CompareFilesAndLog(const std::wstring& expectedPath, const std::wstring& actualPath)
 {
     auto e = ReadAllUtf8(expectedPath);
     auto a = ReadAllUtf8(actualPath);
-    // Quick exact check
-    if (e == a) return true;
 
-    // Ignore whitespace-only differences (pretty vs minified JSON)
-    auto stripWs = [](const std::string& s) -> std::string
-    {
-        std::string out;
-        out.reserve(s.size());
-        for (char ch : s)
-        {
-            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
-                continue;
-            out.push_back(ch);
-        }
-        return out;
-    };
-    if (stripWs(e) == stripWs(a))
-    {
-        // Content is the same modulo whitespace.
+    // Fast path: CRC match -> treat as equal.
+    uint32_t crcE = Crc32(reinterpret_cast<const uint8_t*>(e.data()), e.size());
+    uint32_t crcA = Crc32(reinterpret_cast<const uint8_t*>(a.data()), a.size());
+    if (crcE == crcA)
         return true;
+
+    LogMessage(L"[Test] settings.json mismatch detected (CRC differs)");
+
+    // Parse via WinRT JSON
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
+
+    winrt::Windows::Data::Json::JsonObject je;
+    winrt::Windows::Data::Json::JsonObject ja;
+    try
+    {
+        je = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(e));
+        ja = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(a));
+    }
+    catch (winrt::hresult_error const& ex)
+    {
+        std::wstring msg = L"[Test] JSON parse threw hresult_error: ";
+        msg += ex.message().c_str();
+        LogMessage(msg);
+        return false;
     }
 
-    LogMessage(L"[Test] settings.json mismatch detected");
+    std::unordered_map<std::wstring, std::wstring> fieldsExpected;
+    std::unordered_map<std::wstring, std::wstring> fieldsActual;
 
-    std::wstring we(e.begin(), e.end());
-    std::wstring wa(a.begin(), a.end());
-    std::wstringstream es(we), as(wa);
-    std::wstring eline, aline;
-    size_t lineNo = 1;
-    while (std::getline(es, eline) && std::getline(as, aline))
+    FlattenJsonValueWinRT(je, L"", fieldsExpected);
+    FlattenJsonValueWinRT(ja, L"", fieldsActual);
+
+    bool ok = true;
+
+    // Fields missing or different vs default
+    for (const auto& kv : fieldsExpected)
     {
-        if (eline != aline)
+        auto it = fieldsActual.find(kv.first);
+        if (it == fieldsActual.end())
         {
-            std::wstring msg = L"[Test] line " + std::to_wstring(lineNo) + L" differs:\n  expected: " + eline + L"\n  actual  : " + aline;
+            std::wstring msg = L"[Test] settings.json missing field: ";
+            msg += kv.first;
             LogMessage(msg);
+            ok = false;
         }
-        ++lineNo;
-    }
-    while (std::getline(es, eline))
-    {
-        std::wstring msg = L"[Test] extra expected line " + std::to_wstring(lineNo) + L": " + eline;
-        LogMessage(msg);
-        ++lineNo;
-    }
-    while (std::getline(as, aline))
-    {
-        std::wstring msg = L"[Test] extra actual line " + std::to_wstring(lineNo) + L": " + aline;
-        LogMessage(msg);
-        ++lineNo;
+        else if (it->second != kv.second)
+        {
+            std::wstring msg = L"[Test] settings.json field mismatch at ";
+            msg += kv.first;
+            msg += L": expected=";
+            msg += kv.second;
+            msg += L", actual=";
+            msg += it->second;
+            LogMessage(msg);
+            ok = false;
+        }
     }
 
-    return false;
+    // Extra fields present in actual
+    for (const auto& kv : fieldsActual)
+    {
+        if (fieldsExpected.find(kv.first) == fieldsExpected.end())
+        {
+            std::wstring msg = L"[Test] settings.json has extra field: ";
+            msg += kv.first;
+            msg += L" = ";
+            msg += kv.second;
+            LogMessage(msg);
+            ok = false;
+        }
+    }
+
+    return ok;
 }
 
 struct AppCloser
