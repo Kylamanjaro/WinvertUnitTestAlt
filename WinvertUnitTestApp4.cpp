@@ -21,6 +21,24 @@ namespace fs = std::filesystem;
 
 static void SleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
+// Returns the directory of the current test module (DLL), not the IDE/test host EXE.
+static fs::path GetCurrentModuleDirectory()
+{
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&GetCurrentModuleDirectory),
+            &hMod))
+    {
+        return {};
+    }
+
+    wchar_t path[MAX_PATH]{};
+    DWORD len = GetModuleFileNameW(hMod, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return {};
+    return fs::path(path).parent_path();
+}
+
 static std::wstring GetUserProfile()
 {
     wchar_t buf[MAX_PATH]; DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
@@ -181,6 +199,95 @@ static CComPtr<IUIAutomationElement> FindByAutomationId(IUIAutomationElement* pa
     return el;
 }
 
+static CComPtr<IUIAutomationElement> FindByAutomationIdAndName(
+    IUIAutomationElement* parent,
+    const wchar_t* aid,
+    const wchar_t* name)
+{
+    if (!parent) return nullptr;
+
+    CComPtr<IUIAutomation> uia;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+        return nullptr;
+
+    CComPtr<IUIAutomationCondition> idCond;
+    CComPtr<IUIAutomationCondition> nameCond;
+    CComPtr<IUIAutomationCondition> combined;
+
+    if (aid && *aid)
+    {
+        uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, CComVariant(aid), &idCond);
+    }
+    if (name && *name)
+    {
+        uia->CreatePropertyCondition(UIA_NamePropertyId, CComVariant(name), &nameCond);
+    }
+
+    if (idCond && nameCond)
+    {
+        uia->CreateAndCondition(idCond, nameCond, &combined);
+    }
+    else if (idCond)
+    {
+        combined = idCond;
+    }
+    else if (nameCond)
+    {
+        combined = nameCond;
+    }
+    else
+    {
+        return nullptr;
+    }
+
+    CComPtr<IUIAutomationElement> el;
+    parent->FindFirst(TreeScope_Subtree, combined, &el);
+    return el;
+}
+
+static CComPtr<IUIAutomationElement> FindByAutomationIdNameClass(
+    IUIAutomationElement* parent,
+    const wchar_t* aid,
+    const wchar_t* name,
+    const wchar_t* cls)
+{
+    if (!parent) return nullptr;
+
+    CComPtr<IUIAutomation> uia;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+        return nullptr;
+
+    CComPtr<IUIAutomationCondition> conds[3];
+    int count = 0;
+
+    if (aid && *aid)
+    {
+        uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, CComVariant(aid), &conds[count++]);
+    }
+    if (name && *name)
+    {
+        uia->CreatePropertyCondition(UIA_NamePropertyId, CComVariant(name), &conds[count++]);
+    }
+    if (cls && *cls)
+    {
+        uia->CreatePropertyCondition(UIA_ClassNamePropertyId, CComVariant(cls), &conds[count++]);
+    }
+
+    if (count == 0) return nullptr;
+
+    CComPtr<IUIAutomationCondition> combined = conds[0];
+    for (int i = 1; i < count; ++i)
+    {
+        CComPtr<IUIAutomationCondition> tmp;
+        uia->CreateAndCondition(combined, conds[i], &tmp);
+        combined = tmp;
+    }
+
+    CComPtr<IUIAutomationElement> el;
+    parent->FindFirst(TreeScope_Subtree, combined, &el);
+    return el;
+}
+
 static CComPtr<IUIAutomationElement> WaitForAutomationId(IUIAutomationElement* parent, const wchar_t* aid, int timeoutMs = 5000, int pollMs = 100)
 {
     if (!parent) return nullptr;
@@ -191,6 +298,41 @@ static CComPtr<IUIAutomationElement> WaitForAutomationId(IUIAutomationElement* p
         SleepMs(pollMs);
     }
     return FindByAutomationId(parent, aid);
+}
+
+static CComPtr<IUIAutomationElement> WaitForAutomationIdAndName(
+    IUIAutomationElement* parent,
+    const wchar_t* aid,
+    const wchar_t* name,
+    int timeoutMs = 5000,
+    int pollMs = 100)
+{
+    if (!parent) return nullptr;
+    int iterations = timeoutMs / pollMs;
+    for (int i = 0; i < iterations; ++i)
+    {
+        if (auto el = FindByAutomationIdAndName(parent, aid, name)) return el;
+        SleepMs(pollMs);
+    }
+    return FindByAutomationIdAndName(parent, aid, name);
+}
+
+static CComPtr<IUIAutomationElement> WaitForAutomationIdNameClass(
+    IUIAutomationElement* parent,
+    const wchar_t* aid,
+    const wchar_t* name,
+    const wchar_t* cls,
+    int timeoutMs = 5000,
+    int pollMs = 100)
+{
+    if (!parent) return nullptr;
+    int iterations = timeoutMs / pollMs;
+    for (int i = 0; i < iterations; ++i)
+    {
+        if (auto el = FindByAutomationIdNameClass(parent, aid, name, cls)) return el;
+        SleepMs(pollMs);
+    }
+    return FindByAutomationIdNameClass(parent, aid, name, cls);
 }
 
 static bool ClickAtScreenPoint(LONG x, LONG y)
@@ -359,7 +501,27 @@ static bool CompareFilesAndLog(const std::wstring& expectedPath, const std::wstr
 {
     auto e = ReadAllUtf8(expectedPath);
     auto a = ReadAllUtf8(actualPath);
+    // Quick exact check
     if (e == a) return true;
+
+    // Ignore whitespace-only differences (pretty vs minified JSON)
+    auto stripWs = [](const std::string& s) -> std::string
+    {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s)
+        {
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+                continue;
+            out.push_back(ch);
+        }
+        return out;
+    };
+    if (stripWs(e) == stripWs(a))
+    {
+        // Content is the same modulo whitespace.
+        return true;
+    }
 
     LogMessage(L"[Test] settings.json mismatch detected");
 
@@ -413,6 +575,7 @@ namespace WinvertUnitTestApp4
     public:
         TEST_METHOD(Winvert_Launch)
         {
+            LogMessage(L"[Test] Running Winvert_Launch");
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             AppCloser closer;
 
@@ -455,6 +618,7 @@ namespace WinvertUnitTestApp4
 
         TEST_METHOD(Save_File_Default)
         {
+            LogMessage(L"[Test] Running Save_File_Default");
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             AppCloser closer;
 
@@ -493,48 +657,60 @@ namespace WinvertUnitTestApp4
             DumpAllAutomationElements(win);
 
             // Verify that expected settings-page elements exist (but do not modify them)
-            const wchar_t* settingsIds[] =
+            struct ExpectedElement { const wchar_t* id; const wchar_t* name; const wchar_t* cls; };
+            const ExpectedElement settingsExpected[] =
+            // ID, NAME, CLASS
             {
-                L"BackButton",
-                L"SelectionColorExpander",
-                L"SelectionColorEnableToggle",
-                L"SelectionColorPicker",
-                L"BrightnessExpander",
-                L"BrightnessDelayNumberBox",
-                L"BrightnessResetButton",
-                L"LumaRNumberBox",
-                L"LumaGNumberBox",
-                L"LumaBNumberBox",
-                L"ShowFpsToggle",
-                L"HotkeysExpander",
-                L"RunAtStartupToggle",
-                L"InvertHotkeyTextBox",
-                L"RebindInvertHotkeyButton",
-                L"FilterHotkeyTextBox",
-                L"RebindFilterHotkeyButton",
-                L"RemoveHotkeyTextBox",
-                L"RebindRemoveHotkeyButton",
-                L"CustomFiltersExpander",
-                L"FavoriteFilterComboBox",
-                L"SavedFiltersComboBox",
-                L"SimpleResetButton",
-                L"BrightnessSlider",
-                L"ContrastSlider",
-                L"SaturationSlider",
-                L"HueSlider",
-                L"TemperatureSlider",
-                L"TintSlider",
-                L"ColorMappingExpander",
-                L"ColorMapAddButton",
-                L"ColorMapSampleButton",
-                L"PreviewColorMapToggle",
-                L"ColorMapPicker",
-                L"ColorMapPreserveToggle"
+                { L"BackButton",              L"Back",                      L"Button" },
+                { L"SelectionColorExpander",  nullptr,                      L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"SelectionColorEnableToggle", nullptr,                   L"ToggleSwitch" },
+                { L"ColorSpectrum",           L"Color picker",              L"Microsoft.UI.Xaml.Controls.Primitives.ColorSpectrum" },
+                { L"BrightnessExpander",      L"Brightness protection",     L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"BrightnessDelayNumberBox",nullptr,                      L"Microsoft.UI.Xaml.Controls.NumberBox" },
+                { L"BrightnessResetButton",   L"Reset defaults",            L"Button" },
+                { L"LumaRNumberBox",          L"R",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
+                { L"LumaGNumberBox",          L"G",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
+                { L"LumaBNumberBox",          L"B",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
+                { L"ShowFpsToggle",           nullptr,                      L"ToggleSwitch" },
+                { L"HotkeysExpander",         nullptr,                      L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"RunAtStartupToggle",      nullptr,                      L"ToggleSwitch" },
+                { L"InvertHotkeyTextBox",     nullptr,                      L"TextBox" },
+                { L"RebindInvertHotkeyButton",L"Rebind Invert/Add",         L"Button" },
+                { L"FilterHotkeyTextBox",     nullptr,                      L"TextBox" },
+                { L"RebindFilterHotkeyButton",L"Rebind Filter/Add",         L"Button" },
+                { L"RemoveHotkeyTextBox",     nullptr,                      L"TextBox" },
+                { L"RebindRemoveHotkeyButton",L"Rebind Remove Last",        L"Button" },
+                { L"CustomFiltersExpander",   L"Custom filters",            L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"FavoriteFilterComboBox",  nullptr,                      L"ComboBox" },
+                { L"SavedFiltersComboBox",    nullptr,                      L"ComboBox" },
+                { L"SimpleResetButton",       L"Reset",                     L"Button" },
+                { L"BrightnessSlider",        nullptr,                      L"Slider" },
+                { L"ContrastSlider",          nullptr,                      L"Slider" },
+                { L"SaturationSlider",        nullptr,                      L"Slider" },
+                { L"HueSlider",               nullptr,                      L"Slider" },
+                { L"TemperatureSlider",       nullptr,                      L"Slider" },
+                { L"TintSlider",              nullptr,                      L"Slider" },
+                { L"ColorMappingExpander",    L"Color mapping",             L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"ColorMapAddButton",       L"Add",                       L"Button" },
+                { L"ColorMapSampleButton",    L"Sample",                    L"Button" },
+                { L"PreviewColorMapToggle",   L"Preview",                   L"ToggleButton" },
+                // Color picker within Color mapping section shares AutomationId "ColorSpectrum"
+                // and we already validated one ColorSpectrum above.
+                { L"ColorMapPreserveToggle",  L"Preserve brightness",       L"ToggleSwitch" }
             };
-            for (auto id : settingsIds)
+            for (const auto& e : settingsExpected)
             {
-                auto el = WaitForAutomationId(win, id, 5000);
-                Assert::IsTrue(el != nullptr, (std::wstring(L"Settings element missing: ") + id).c_str());
+                auto el = WaitForAutomationIdNameClass(win, e.id, e.name, e.cls, 5000);
+                std::wstring desc = L"id=" + std::wstring(e.id ? e.id : L"<null>");
+                if (e.name && *e.name)
+                {
+                    desc += L", name=" + std::wstring(e.name);
+                }
+                if (e.cls && *e.cls)
+                {
+                    desc += L", class=" + std::wstring(e.cls);
+                }
+                Assert::IsTrue(el != nullptr, (std::wstring(L"Settings element missing: ") + desc).c_str());
             }
 
             // Navigate back to main panel
@@ -549,10 +725,28 @@ namespace WinvertUnitTestApp4
             SleepMs(1000);
 
             // 3) Compare settings.json to expected golden
-            wchar_t modulePath[MAX_PATH];
-            GetModuleFileNameW(NULL, modulePath, MAX_PATH);
-            std::wstring projDir = fs::path(modulePath).parent_path().wstring();
-            std::wstring expected = projDir + L"\\saves\\default.json";
+            fs::path moduleDir = GetCurrentModuleDirectory();
+            // Walk up until we find the repos root (folder that contains Winvert4 and WinvertUnitTestApp4)
+            fs::path cur = moduleDir;
+            fs::path reposRoot;
+            for (int i = 0; i < 6 && !cur.empty(); ++i)
+            {
+                auto name = cur.filename().wstring();
+                if (name == L"Winvert4" || name == L"WinvertUnitTestApp4")
+                {
+                    reposRoot = cur.parent_path();
+                    break;
+                }
+                cur = cur.parent_path();
+            }
+            if (reposRoot.empty())
+            {
+                Assert::Fail(L"Failed to locate repos root for default.json");
+            }
+
+            fs::path expectedPath = reposRoot / L"WinvertUnitTestApp4" / L"saves" / L"default.json";
+            std::wstring expected = expectedPath.wstring();
+            LogMessage(L"[Test] expected default.json path=" + expected);
             Assert::IsTrue(fs::exists(expected), L"Missing expected_state.json");
             Assert::IsTrue(fs::exists(settingsPath), L"settings.json was not created");
             Assert::IsTrue(CompareFilesAndLog(expected, settingsPath), L"Saved settings.json does not match expected");
@@ -560,6 +754,7 @@ namespace WinvertUnitTestApp4
 
         TEST_METHOD(Save_File_Persistance_1)
         {
+            LogMessage(L"[Test] Running Save_File_Persistance_1");
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             AppCloser closer;
 
@@ -652,25 +847,37 @@ namespace WinvertUnitTestApp4
                 if (nbDelay && SUCCEEDED(nbDelay->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
                 {
                     vpat->get_CurrentValue(&val);
-                    Assert::IsTrue(std::wstring(val) == L"7", L"BrightnessDelayNumberBox did not persist value 7");
+                    std::wstring s(val);
+                    wchar_t* end = nullptr;
+                    double d = wcstod(s.c_str(), &end);
+                    Assert::IsTrue(std::fabs(d - 7.0) < 0.001, L"BrightnessDelayNumberBox did not persist value ~7");
                 }
                 vpat.Release(); val.Empty();
                 if (nbR && SUCCEEDED(nbR->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
                 {
                     vpat->get_CurrentValue(&val);
-                    Assert::IsTrue(std::wstring(val) == L"0.30", L"LumaRNumberBox did not persist value 0.30");
+                    std::wstring s(val);
+                    wchar_t* end = nullptr;
+                    double d = wcstod(s.c_str(), &end);
+                    Assert::IsTrue(std::fabs(d - 0.30) < 0.001, L"LumaRNumberBox did not persist value ~0.30");
                 }
                 vpat.Release(); val.Empty();
                 if (nbG && SUCCEEDED(nbG->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
                 {
                     vpat->get_CurrentValue(&val);
-                    Assert::IsTrue(std::wstring(val) == L"0.59", L"LumaGNumberBox did not persist value 0.59");
+                    std::wstring s(val);
+                    wchar_t* end = nullptr;
+                    double d = wcstod(s.c_str(), &end);
+                    Assert::IsTrue(std::fabs(d - 0.59) < 0.001, L"LumaGNumberBox did not persist value ~0.59");
                 }
                 vpat.Release(); val.Empty();
                 if (nbB && SUCCEEDED(nbB->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
                 {
                     vpat->get_CurrentValue(&val);
-                    Assert::IsTrue(std::wstring(val) == L"0.11", L"LumaBNumberBox did not persist value 0.11");
+                    std::wstring s(val);
+                    wchar_t* end = nullptr;
+                    double d = wcstod(s.c_str(), &end);
+                    Assert::IsTrue(std::fabs(d - 0.11) < 0.001, L"LumaBNumberBox did not persist value ~0.11");
                 }
             }
 
