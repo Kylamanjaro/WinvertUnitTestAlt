@@ -943,6 +943,17 @@ namespace WinvertUnitTestApp4
                     std::wstring v = getField(key);
                     if (v.empty()) return;
                     v = StripJsonStringQuotes(v);
+
+                    if (wcscmp(controlId, L"EditableText") == 0)
+                    {
+                        std::wstring msg = L"[Test] Setting filter name in EditableText from key ";
+                        msg += key;
+                        msg += L" to \"";
+                        msg += v;
+                        msg += L"\"";
+                        LogMessage(msg);
+                    }
+
                     auto el = WaitForAutomationId(win, controlId);
                     Assert::IsTrue(el != nullptr, (std::wstring(L"Missing text control: ") + controlId).c_str());
                     Assert::IsTrue(SetValue(el, v.c_str()),
@@ -1225,10 +1236,70 @@ namespace WinvertUnitTestApp4
                 verifyNumber(L"LumaGNumberBox", L"brightness.lumaWeights[1]");
                 verifyNumber(L"LumaBNumberBox", L"brightness.lumaWeights[2]");
 
-                // Text
-                // Filter name is persisted in JSON (`savedFilters[0].name`) and appears in the
-                // saved-filters dropdown, not necessarily in the EditableText box on reload,
-                // so we skip strict UI verification of EditableText here for now.
+                // Text / saved filter dropdown
+                // The saved filter name from JSON should appear as one of the items in SavedFiltersComboBox.
+                auto verifyComboContainsItem = [&](const wchar_t* controlId, const wchar_t* key)
+                {
+                    std::wstring v = getField(key);
+                    if (v.empty()) return;
+                    v = StripJsonStringQuotes(v);
+
+                    auto combo = WaitForAutomationId(win, controlId);
+                    Assert::IsTrue(combo != nullptr, (std::wstring(L"Missing combo on relaunch: ") + controlId).c_str());
+
+                    // Try to expand the combo to materialize its items
+                    CComPtr<IUIAutomationExpandCollapsePattern> ecp;
+                    if (SUCCEEDED(combo->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&ecp))) && ecp)
+                    {
+                        ecp->Expand();
+                        SleepMs(300);
+                    }
+
+                    // Search for a ListItem descendant whose Name matches v
+                    CComPtr<IUIAutomation> uia;
+                    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+                        return;
+
+                    CComPtr<IUIAutomationCondition> trueCond;
+                    if (FAILED(uia->CreateTrueCondition(&trueCond)) || !trueCond)
+                        return;
+
+                    CComPtr<IUIAutomationElementArray> arr;
+                    if (FAILED(combo->FindAll(TreeScope_Subtree, trueCond, &arr)) || !arr)
+                        return;
+
+                    int length = 0;
+                    arr->get_Length(&length);
+                    bool found = false;
+                    for (int i = 0; i < length && !found; ++i)
+                    {
+                        CComPtr<IUIAutomationElement> item;
+                        if (FAILED(arr->GetElement(i, &item)) || !item) continue;
+
+                        CComVariant nameVar;
+                        item->GetCurrentPropertyValue(UIA_NamePropertyId, &nameVar);
+                        if (nameVar.vt == VT_BSTR && nameVar.bstrVal)
+                        {
+                            std::wstring name(nameVar.bstrVal);
+                            if (name == v)
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        std::wstring msg = L"[Test] SavedFiltersComboBox does not contain expected filter name \"";
+                        msg += v;
+                        msg += L"\"";
+                        LogMessage(msg);
+                        Assert::Fail(L"Saved filter name not found in SavedFiltersComboBox on relaunch");
+                    }
+                };
+
+                verifyComboContainsItem(L"SavedFiltersComboBox", L"savedFilters[0].name");
 
                 CloseWindow(win);
                 closer.closed = true;
@@ -1256,6 +1327,14 @@ namespace WinvertUnitTestApp4
 
             // Scenario 2: settings2.json
             {
+                // Ensure we start from a clean default state again,
+                // with no settings.json from the previous scenario.
+                if (fs::exists(settingsPath))
+                {
+                    fs::remove(settingsPath);
+                    LogMessage(L"[Test] Save_File_Persistance: deleted previous settings.json before settings2.json scenario");
+                }
+
                 fs::path moduleDir = GetCurrentModuleDirectory();
                 fs::path cur = moduleDir;
                 fs::path reposRoot;
