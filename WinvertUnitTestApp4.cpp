@@ -910,9 +910,30 @@ namespace WinvertUnitTestApp4
                 // 1) Advanced Matrix: ensure it's enabled and dump controls
                 if (auto adv = WaitForAutomationId(win, L"AdvancedMatrixToggle"))
                 {
-                    InvokeElement(adv);
+                    // Force it ON instead of just invoking
+                    Assert::IsTrue(
+                        Toggle(adv, ToggleState_On),
+                        L"Failed to enable AdvancedMatrixToggle");
                     SleepMs(500);
                 }
+                LogMessage(L"[Test] AdvancedMatrixToggle Enabled");
+
+                // Try to scroll the main settings ScrollViewer down so dynamically-created
+                // advanced matrix TextBoxes are realized and visible to UIA.
+                if (auto scrollViewer = FindByAutomationIdNameClass(win, nullptr, nullptr, L"ScrollViewer"))
+                {
+                    CComPtr<IUIAutomationScrollPattern> sp;
+                    if (SUCCEEDED(scrollViewer->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp))) && sp)
+                    {
+                        LogMessage(L"[Test] Scrolling settings ScrollViewer to reveal advanced matrix controls");
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            sp->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement);
+                            SleepMs(200);
+                        }
+                    }
+                }
+                SleepMs(2000);
                 DumpAllAutomationElements(win);
 
                 // Helpers to drive controls from fields
