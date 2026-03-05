@@ -362,6 +362,30 @@ static bool CloseWindow(IUIAutomationElement* win)
     return SUCCEEDED(pat->Close());
 }
 
+static void WaitForProcessExit(DWORD pid, int timeoutMs = 5000)
+{
+    if (pid == 0) return;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return;
+    WaitForSingleObject(h, timeoutMs);
+    CloseHandle(h);
+}
+
+static void EnsureProcessExited(DWORD pid, int timeoutMs = 5000)
+{
+    if (pid == 0) return;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+    if (!h) return;
+    DWORD wait = WaitForSingleObject(h, timeoutMs);
+    if (wait == WAIT_TIMEOUT)
+    {
+        LogMessage(L"[Test] Process did not exit in time; terminating");
+        TerminateProcess(h, 1);
+        WaitForSingleObject(h, 2000);
+    }
+    CloseHandle(h);
+}
+
 static void DumpAllAutomationElements(IUIAutomationElement* root)
 {
     if (!root) return;
@@ -750,7 +774,7 @@ namespace WinvertUnitTestApp4
 
             // Expand all settings expanders so nested controls are realized in the tree.
             LogMessage(L"[Test] Expanding all settings expanders");
-            ExpandAllSettingsExpanders(win);
+                  ExpandAllSettingsExpanders(win);
 
             LogMessage(L"[Test] Dumping elements after opening Settings");
             DumpAllAutomationElements(win);
@@ -943,7 +967,12 @@ namespace WinvertUnitTestApp4
                     if (v.empty()) return;
                     bool desired{};
                     if (!JsonBoolLiteralToBool(v, desired)) return;
-                    auto el = WaitForAutomationId(win, controlId);
+                      auto el = WaitForAutomationId(win, controlId);
+                      if (!el)
+                      {
+                          // Fallback: dynamically-created controls may expose their identifier as Name.
+                          el = WaitForAutomationIdNameClass(win, nullptr, controlId, L"TextBox");
+                      }
                     Assert::IsTrue(el != nullptr, (std::wstring(L"Missing toggle: ") + controlId).c_str());
                     Assert::IsTrue(Toggle(el, desired ? ToggleState_On : ToggleState_Off),
                                    (std::wstring(L"Failed to set toggle: ") + controlId).c_str());
@@ -981,6 +1010,68 @@ namespace WinvertUnitTestApp4
                                    (std::wstring(L"Failed to set text for: ") + controlId).c_str());
                 };
 
+                auto setComboTextFromField = [&](const wchar_t* comboId, const wchar_t* key)
+                {
+                    std::wstring v = getField(key);
+                    if (v.empty()) return;
+                    v = StripJsonStringQuotes(v);
+
+                    std::wstring msg = L"[Test] Setting combo text ";
+                    msg += comboId;
+                    msg += L" to \"";
+                    msg += v;
+                    msg += L"\"";
+                    LogMessage(msg);
+
+                    auto combo = WaitForAutomationId(win, comboId);
+                    Assert::IsTrue(combo != nullptr, (std::wstring(L"Missing combo: ") + comboId).c_str());
+
+                    if (!SetValue(combo, v.c_str()))
+                    {
+                        // Fallback to inner editable TextBox if ValuePattern isn't exposed on ComboBox
+                        if (auto inner = FindByAutomationId(combo, L"EditableText"))
+                        {
+                            Assert::IsTrue(SetValue(inner, v.c_str()),
+                                           (std::wstring(L"Failed to set combo text via EditableText: ") + comboId).c_str());
+                        }
+                    }
+
+                    // Move focus away to ensure ComboBox text is committed
+                    if (auto focusTarget = WaitForAutomationId(win, L"FilterMat_r0c0"))
+                    {
+                        InvokeElement(focusTarget);
+                        SleepMs(100);
+                    }
+                };
+
+                // 1) Advanced matrix values (4x4 + offset row) from savedFilters[0]
+                // Ensure the grid is realized before setting values.
+                {
+                    auto first = WaitForAutomationId(win, L"FilterMat_r0c0", 5000);
+                    if (!first)
+                    {
+                        first = WaitForAutomationIdNameClass(win, nullptr, L"FilterMat_r0c0", L"TextBox", 5000);
+                    }
+                    Assert::IsTrue(first != nullptr, L"Advanced matrix grid not realized (FilterMat_r0c0 missing)");
+                }
+
+                for (int r = 0; r < 4; ++r)
+                {
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        int idx = r * 4 + c;
+                        std::wstring controlId = L"FilterMat_r" + std::to_wstring(r) + L"c" + std::to_wstring(c);
+                        std::wstring key = L"savedFilters[0].mat[" + std::to_wstring(idx) + L"]";
+                        setNumberFromField(controlId.c_str(), key.c_str());
+                    }
+                }
+                for (int c = 0; c < 4; ++c)
+                {
+                    std::wstring controlId = L"FilterOffset_c" + std::to_wstring(c);
+                    std::wstring key = L"savedFilters[0].offset[" + std::to_wstring(c) + L"]";
+                    setNumberFromField(controlId.c_str(), key.c_str());
+                }
+
                 // 2) Custom Border Color
                 setToggleFromField(L"SelectionColorEnableToggle", L"toggles.selectionColorEnabled");
                 setNumberFromField(L"RedTextBox",   L"selectionColor.r");
@@ -1003,7 +1094,7 @@ namespace WinvertUnitTestApp4
                 }
 
                 // 6) Custom Filters: set name and save
-                setTextFromField(L"EditableText", L"savedFilters[0].name");
+                setComboTextFromField(L"SavedFiltersComboBox", L"savedFilters[0].name");
                 if (auto saveFilter = WaitForAutomationId(win, L"SaveFilterButton"))
                 {
                     Assert::IsTrue(InvokeElement(saveFilter), L"Failed to click SaveFilterButton");
@@ -1022,6 +1113,7 @@ namespace WinvertUnitTestApp4
                 CloseWindow(win);
                 closer.closed = true;
                 SleepMs(1000);
+                EnsureProcessExited(pid, 5000);
 
                 // Verify subset of JSON fields persisted as expected
                 Assert::IsTrue(fs::exists(settingsPath), L"settings.json was not written after driving UI");
@@ -1056,6 +1148,16 @@ namespace WinvertUnitTestApp4
                         LogMessage(msg);
                         ok = false;
                         continue;
+                    }
+
+                    {
+                        std::wstring msg = L"[Test] scenario " + label + L": field ";
+                        msg += key;
+                        msg += L" expected=";
+                        msg += itE->second;
+                        msg += L" actual=";
+                        msg += itA->second;
+                        LogMessage(msg);
                     }
 
                     // For numeric fields (like lumaWeights), compare as doubles with tolerance.
@@ -1250,16 +1352,155 @@ namespace WinvertUnitTestApp4
                 //verifyNumber(L"GreenTextBox", L"selectionColor.g");
                 //verifyNumber(L"BlueTextBox", L"selectionColor.b");
 
-                // Numbers
-                // selectionColor.* is validated via JSON subset; skip strict UI verification for now.
-                verifyNumber(L"BrightnessDelayNumberBox", L"brightness.delayFrames");
-                verifyNumber(L"LumaRNumberBox", L"brightness.lumaWeights[0]");
-                verifyNumber(L"LumaGNumberBox", L"brightness.lumaWeights[1]");
-                verifyNumber(L"LumaBNumberBox", L"brightness.lumaWeights[2]");
+                  // Numbers
+                  // selectionColor.* is validated via JSON subset; skip strict UI verification for now.
+                  verifyNumber(L"BrightnessDelayNumberBox", L"brightness.delayFrames");
+                  verifyNumber(L"LumaRNumberBox", L"brightness.lumaWeights[0]");
+                  verifyNumber(L"LumaGNumberBox", L"brightness.lumaWeights[1]");
+                  verifyNumber(L"LumaBNumberBox", L"brightness.lumaWeights[2]");
+
+                  // Advanced matrix grid: ensure it is visible, log values, and
+                  // validate the 4x4 matrix cells and 4-element offset row against
+                  // the savedFilters[0].mat/off entries from the golden JSON.
+                  if (auto adv2 = WaitForAutomationId(win, L"AdvancedMatrixToggle"))
+                  {
+                      Assert::IsTrue(
+                          Toggle(adv2, ToggleState_On),
+                          L"Failed to enable AdvancedMatrixToggle on relaunch");
+                      SleepMs(500);
+                  }
+                  if (auto scrollViewer2 = FindByAutomationIdNameClass(win, nullptr, nullptr, L"ScrollViewer"))
+                  {
+                      CComPtr<IUIAutomationScrollPattern> sp2;
+                      if (SUCCEEDED(scrollViewer2->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp2))) && sp2)
+                      {
+                          for (int i = 0; i < 4; ++i)
+                          {
+                              sp2->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement);
+                              SleepMs(200);
+                          }
+                      }
+                  }
+
+                  // Ensure the saved filter is selected so the grid reflects its values.
+                  auto selectComboItemByName = [&](const wchar_t* controlId, const wchar_t* key)
+                  {
+                      std::wstring v = getField(key);
+                      if (v.empty()) return;
+                      v = StripJsonStringQuotes(v);
+
+                      auto combo = WaitForAutomationId(win, controlId);
+                      Assert::IsTrue(combo != nullptr, (std::wstring(L"Missing combo on relaunch: ") + controlId).c_str());
+
+                      CComPtr<IUIAutomationExpandCollapsePattern> ecp;
+                      if (SUCCEEDED(combo->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&ecp))) && ecp)
+                      {
+                          ecp->Expand();
+                          SleepMs(300);
+                      }
+
+                      CComPtr<IUIAutomation> uia;
+                      if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+                          return;
+
+                      CComPtr<IUIAutomationCondition> trueCond;
+                      if (FAILED(uia->CreateTrueCondition(&trueCond)) || !trueCond)
+                          return;
+
+                      CComPtr<IUIAutomationElementArray> arr;
+                      if (FAILED(combo->FindAll(TreeScope_Subtree, trueCond, &arr)) || !arr)
+                          return;
+
+                      int length = 0;
+                      arr->get_Length(&length);
+                      for (int i = 0; i < length; ++i)
+                      {
+                          CComPtr<IUIAutomationElement> item;
+                          if (FAILED(arr->GetElement(i, &item)) || !item) continue;
+
+                          CComVariant nameVar;
+                          item->GetCurrentPropertyValue(UIA_NamePropertyId, &nameVar);
+                          if (nameVar.vt == VT_BSTR && nameVar.bstrVal)
+                          {
+                              std::wstring name(nameVar.bstrVal);
+                              if (name == v)
+                              {
+                                  InvokeElement(item);
+                                  SleepMs(300);
+                                  break;
+                              }
+                          }
+                      }
+                  };
+
+                  selectComboItemByName(L"SavedFiltersComboBox", L"savedFilters[0].name");
+
+                  // Helper: log each matrix/offset cell's UI value and expected JSON value
+                  auto logMatrixCell = [&](const std::wstring& controlId, const std::wstring& key)
+                  {
+                      std::wstring expected = getField(key.c_str());
+                      auto el = WaitForAutomationId(win, controlId.c_str());
+                      if (!el)
+                      {
+                          el = WaitForAutomationIdNameClass(win, nullptr, controlId.c_str(), L"TextBox");
+                      }
+                      if (!el)
+                      {
+                          std::wstring msg = L"[Test] MatrixCell control=";
+                          msg += controlId;
+                          msg += L", key=";
+                          msg += key;
+                          msg += L": element not found";
+                          LogMessage(msg);
+                          return;
+                      }
+
+                      CComPtr<IUIAutomationValuePattern> vpat;
+                      if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
+                      {
+                          CComBSTR val;
+                          if (SUCCEEDED(vpat->get_CurrentValue(&val)))
+                          {
+                              std::wstring actual(val);
+                              std::wstring msg = L"[Test] MatrixCell control=";
+                              msg += controlId;
+                              msg += L", key=";
+                              msg += key;
+                              msg += L", uiValue=\"";
+                              msg += actual;
+                              msg += L"\", json=\"";
+                              msg += expected;
+                              msg += L"\"";
+                              LogMessage(msg);
+                          }
+                      }
+                  };
+
+                  // Matrix (4x4)
+                  for (int r = 0; r < 4; ++r)
+                  {
+                      for (int c = 0; c < 4; ++c)
+                      {
+                          int idx = r * 4 + c;
+                          std::wstring controlId = L"FilterMat_r" + std::to_wstring(r) + L"c" + std::to_wstring(c);
+                          std::wstring key = L"savedFilters[0].mat[" + std::to_wstring(idx) + L"]";
+                          logMatrixCell(controlId, key);
+                          verifyNumber(controlId.c_str(), key.c_str());
+                      }
+                  }
+
+                  // Offset row (4)
+                  for (int c = 0; c < 4; ++c)
+                  {
+                      std::wstring controlId = L"FilterOffset_c" + std::to_wstring(c);
+                      std::wstring key = L"savedFilters[0].offset[" + std::to_wstring(c) + L"]";
+                      logMatrixCell(controlId, key);
+                      verifyNumber(controlId.c_str(), key.c_str());
+                  }
 
                 // Text / saved filter dropdown
                 // The saved filter name from JSON should appear as one of the items in SavedFiltersComboBox.
-                auto verifyComboContainsItem = [&](const wchar_t* controlId, const wchar_t* key)
+                  auto verifyComboContainsItem = [&](const wchar_t* controlId, const wchar_t* key)
                 {
                     std::wstring v = getField(key);
                     if (v.empty()) return;
@@ -1354,6 +1595,12 @@ namespace WinvertUnitTestApp4
                 {
                     fs::remove(settingsPath);
                     LogMessage(L"[Test] Save_File_Persistance: deleted previous settings.json before settings2.json scenario");
+                }
+                // Double-check the file is gone before launching the next scenario.
+                for (int i = 0; i < 10 && fs::exists(settingsPath); ++i)
+                {
+                    SleepMs(100);
+                    fs::remove(settingsPath);
                 }
 
                 fs::path moduleDir = GetCurrentModuleDirectory();
