@@ -205,6 +205,17 @@ static CComPtr<IUIAutomationElement> FindByAutomationId(IUIAutomationElement* pa
     return el;
 }
 
+static CComPtr<IUIAutomationElement> FindByAutomationIdScoped(
+    IUIAutomationElement* root,
+    const wchar_t* scopeAutomationId,
+    const wchar_t* targetAutomationId)
+{
+    if (!root || !scopeAutomationId || !targetAutomationId) return nullptr;
+    auto scope = FindByAutomationId(root, scopeAutomationId);
+    if (!scope) return nullptr;
+    return FindByAutomationId(scope, targetAutomationId);
+}
+
 static CComPtr<IUIAutomationElement> FindByAutomationIdNameClass(
     IUIAutomationElement* parent,
     const wchar_t* aid,
@@ -1140,6 +1151,45 @@ namespace WinvertUnitTestApp4
                 {
                     auto itE = goldenFields.find(key);
                     if (itE == goldenFields.end()) continue;
+                    // Special-case saved filter name: match by name, not index.
+                    if (wcscmp(key, L"savedFilters[0].name") == 0)
+                    {
+                        std::wstring expectedName = itE->second;
+                        bool found = false;
+                        std::wstring foundKey;
+                        for (const auto& kv : actualFields)
+                        {
+                            const auto& k = kv.first;
+                            if (k.size() >= 13 &&
+                                k.rfind(L"savedFilters[", 0) == 0 &&
+                                k.find(L"].name") != std::wstring::npos)
+                            {
+                                if (kv.second == expectedName)
+                                {
+                                    found = true;
+                                    foundKey = k;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!found)
+                        {
+                            std::wstring msg = L"[Test] scenario " + label + L": saved filter name not found; expected=";
+                            msg += expectedName;
+                            LogMessage(msg);
+                            ok = false;
+                        }
+                        else
+                        {
+                            std::wstring msg = L"[Test] scenario " + label + L": saved filter name matched at ";
+                            msg += foundKey;
+                            msg += L" value=";
+                            msg += expectedName;
+                            LogMessage(msg);
+                        }
+                        continue;
+                    }
+
                     auto itA = actualFields.find(key);
                     if (itA == actualFields.end())
                     {
@@ -1348,159 +1398,209 @@ namespace WinvertUnitTestApp4
                 // by additional runtime logic, so we skip strict UI verification here.
 
                 // Numbers
-                //verifyNumber(L"RedTextBox", L"selectionColor.r");
-                //verifyNumber(L"GreenTextBox", L"selectionColor.g");
-                //verifyNumber(L"BlueTextBox", L"selectionColor.b");
+                // Selection color text boxes are part of the ColorPicker template and
+                // appear twice (selection color + color mapping), so UIA lookup by id
+                // is ambiguous. We validate selectionColor via JSON subset instead.
+                // verifyNumber(L"RedTextBox", L"selectionColor.r");
+                // verifyNumber(L"GreenTextBox", L"selectionColor.g");
+                // verifyNumber(L"BlueTextBox", L"selectionColor.b");
 
-                  // Numbers
-                  // selectionColor.* is validated via JSON subset; skip strict UI verification for now.
-                  verifyNumber(L"BrightnessDelayNumberBox", L"brightness.delayFrames");
-                  verifyNumber(L"LumaRNumberBox", L"brightness.lumaWeights[0]");
-                  verifyNumber(L"LumaGNumberBox", L"brightness.lumaWeights[1]");
-                  verifyNumber(L"LumaBNumberBox", L"brightness.lumaWeights[2]");
+                // Numbers
+                // selectionColor.* is validated via JSON subset; skip strict UI verification for now.
+                verifyNumber(L"BrightnessDelayNumberBox", L"brightness.delayFrames");
+                verifyNumber(L"LumaRNumberBox", L"brightness.lumaWeights[0]");
+                verifyNumber(L"LumaGNumberBox", L"brightness.lumaWeights[1]");
+                verifyNumber(L"LumaBNumberBox", L"brightness.lumaWeights[2]");
 
-                  // Advanced matrix grid: ensure it is visible, log values, and
-                  // validate the 4x4 matrix cells and 4-element offset row against
-                  // the savedFilters[0].mat/off entries from the golden JSON.
-                  if (auto adv2 = WaitForAutomationId(win, L"AdvancedMatrixToggle"))
-                  {
-                      Assert::IsTrue(
-                          Toggle(adv2, ToggleState_On),
-                          L"Failed to enable AdvancedMatrixToggle on relaunch");
-                      SleepMs(500);
-                  }
-                  if (auto scrollViewer2 = FindByAutomationIdNameClass(win, nullptr, nullptr, L"ScrollViewer"))
-                  {
-                      CComPtr<IUIAutomationScrollPattern> sp2;
-                      if (SUCCEEDED(scrollViewer2->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp2))) && sp2)
-                      {
-                          for (int i = 0; i < 4; ++i)
-                          {
-                              sp2->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement);
-                              SleepMs(200);
-                          }
-                      }
-                  }
+                // Advanced matrix grid: ensure it is visible, log values, and
+                // validate the 4x4 matrix cells and 4-element offset row against
+                // the savedFilters[0].mat/off entries from the golden JSON.
+                if (auto adv2 = WaitForAutomationId(win, L"AdvancedMatrixToggle"))
+                {
+                    Assert::IsTrue(
+                        Toggle(adv2, ToggleState_On),
+                        L"Failed to enable AdvancedMatrixToggle on relaunch");
+                    SleepMs(500);
+                }
+                if (auto scrollViewer2 = FindByAutomationIdNameClass(win, nullptr, nullptr, L"ScrollViewer"))
+                {
+                    CComPtr<IUIAutomationScrollPattern> sp2;
+                    if (SUCCEEDED(scrollViewer2->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp2))) && sp2)
+                    {
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            sp2->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement);
+                            SleepMs(200);
+                        }
+                    }
+                }
 
-                  // Ensure the saved filter is selected so the grid reflects its values.
-                  auto selectComboItemByName = [&](const wchar_t* controlId, const wchar_t* key)
-                  {
-                      std::wstring v = getField(key);
-                      if (v.empty()) return;
-                      v = StripJsonStringQuotes(v);
+                // Ensure the saved filter is selected so the grid reflects its values.
+                auto selectComboItemByName = [&](const wchar_t* controlId, const wchar_t* key)
+                {
+                    std::wstring v = getField(key);
+                    if (v.empty()) return;
+                    v = StripJsonStringQuotes(v);
 
-                      auto combo = WaitForAutomationId(win, controlId);
-                      Assert::IsTrue(combo != nullptr, (std::wstring(L"Missing combo on relaunch: ") + controlId).c_str());
+                    auto combo = WaitForAutomationId(win, controlId);
+                    Assert::IsTrue(combo != nullptr, (std::wstring(L"Missing combo on relaunch: ") + controlId).c_str());
 
-                      CComPtr<IUIAutomationExpandCollapsePattern> ecp;
-                      if (SUCCEEDED(combo->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&ecp))) && ecp)
-                      {
-                          ecp->Expand();
-                          SleepMs(300);
-                      }
+                    CComPtr<IUIAutomationExpandCollapsePattern> ecp;
+                    if (SUCCEEDED(combo->GetCurrentPatternAs(UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&ecp))) && ecp)
+                    {
+                        ecp->Expand();
+                        SleepMs(300);
+                    }
 
-                      CComPtr<IUIAutomation> uia;
-                      if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
-                          return;
+                    CComPtr<IUIAutomation> uia;
+                    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+                        return;
 
-                      CComPtr<IUIAutomationCondition> trueCond;
-                      if (FAILED(uia->CreateTrueCondition(&trueCond)) || !trueCond)
-                          return;
+                    CComPtr<IUIAutomationCondition> trueCond;
+                    if (FAILED(uia->CreateTrueCondition(&trueCond)) || !trueCond)
+                        return;
 
-                      CComPtr<IUIAutomationElementArray> arr;
-                      if (FAILED(combo->FindAll(TreeScope_Subtree, trueCond, &arr)) || !arr)
-                          return;
+                    CComPtr<IUIAutomationElementArray> arr;
+                    if (FAILED(combo->FindAll(TreeScope_Subtree, trueCond, &arr)) || !arr)
+                        return;
 
-                      int length = 0;
-                      arr->get_Length(&length);
-                      for (int i = 0; i < length; ++i)
-                      {
-                          CComPtr<IUIAutomationElement> item;
-                          if (FAILED(arr->GetElement(i, &item)) || !item) continue;
+                    int length = 0;
+                    arr->get_Length(&length);
+                    for (int i = 0; i < length; ++i)
+                    {
+                        CComPtr<IUIAutomationElement> item;
+                        if (FAILED(arr->GetElement(i, &item)) || !item) continue;
 
-                          CComVariant nameVar;
-                          item->GetCurrentPropertyValue(UIA_NamePropertyId, &nameVar);
-                          if (nameVar.vt == VT_BSTR && nameVar.bstrVal)
-                          {
-                              std::wstring name(nameVar.bstrVal);
-                              if (name == v)
-                              {
-                                  InvokeElement(item);
-                                  SleepMs(300);
-                                  break;
-                              }
-                          }
-                      }
-                  };
+                        CComVariant nameVar;
+                        item->GetCurrentPropertyValue(UIA_NamePropertyId, &nameVar);
+                        if (nameVar.vt == VT_BSTR && nameVar.bstrVal)
+                        {
+                            std::wstring name(nameVar.bstrVal);
+                            if (name == v)
+                            {
+                                InvokeElement(item);
+                                SleepMs(300);
+                                break;
+                            }
+                        }
+                    }
+                };
 
-                  selectComboItemByName(L"SavedFiltersComboBox", L"savedFilters[0].name");
+                selectComboItemByName(L"SavedFiltersComboBox", L"savedFilters[0].name");
 
-                  // Helper: log each matrix/offset cell's UI value and expected JSON value
-                  auto logMatrixCell = [&](const std::wstring& controlId, const std::wstring& key)
-                  {
-                      std::wstring expected = getField(key.c_str());
-                      auto el = WaitForAutomationId(win, controlId.c_str());
-                      if (!el)
-                      {
-                          el = WaitForAutomationIdNameClass(win, nullptr, controlId.c_str(), L"TextBox");
-                      }
-                      if (!el)
-                      {
-                          std::wstring msg = L"[Test] MatrixCell control=";
-                          msg += controlId;
-                          msg += L", key=";
-                          msg += key;
-                          msg += L": element not found";
-                          LogMessage(msg);
-                          return;
-                      }
+                // Helper: log each matrix/offset cell's UI value and expected JSON value
+                auto logMatrixCell = [&](const std::wstring& controlId, const std::wstring& key)
+                {
+                    std::wstring expected = getField(key.c_str());
+                    auto el = WaitForAutomationId(win, controlId.c_str());
+                    if (!el)
+                    {
+                        el = WaitForAutomationIdNameClass(win, nullptr, controlId.c_str(), L"TextBox");
+                    }
+                    if (!el)
+                    {
+                        std::wstring msg = L"[Test] MatrixCell control=";
+                        msg += controlId;
+                        msg += L", key=";
+                        msg += key;
+                        msg += L": element not found";
+                        LogMessage(msg);
+                        return;
+                    }
 
-                      CComPtr<IUIAutomationValuePattern> vpat;
-                      if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
-                      {
-                          CComBSTR val;
-                          if (SUCCEEDED(vpat->get_CurrentValue(&val)))
-                          {
-                              std::wstring actual(val);
-                              std::wstring msg = L"[Test] MatrixCell control=";
-                              msg += controlId;
-                              msg += L", key=";
-                              msg += key;
-                              msg += L", uiValue=\"";
-                              msg += actual;
-                              msg += L"\", json=\"";
-                              msg += expected;
-                              msg += L"\"";
-                              LogMessage(msg);
-                          }
-                      }
-                  };
+                    CComPtr<IUIAutomationValuePattern> vpat;
+                    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
+                    {
+                        CComBSTR val;
+                        if (SUCCEEDED(vpat->get_CurrentValue(&val)))
+                        {
+                            std::wstring actual(val);
+                            std::wstring msg = L"[Test] MatrixCell control=";
+                            msg += controlId;
+                            msg += L", key=";
+                            msg += key;
+                            msg += L", uiValue=\"";
+                            msg += actual;
+                            msg += L"\", json=\"";
+                            msg += expected;
+                            msg += L"\"";
+                            LogMessage(msg);
+                        }
+                    }
+                };
 
-                  // Matrix (4x4)
-                  for (int r = 0; r < 4; ++r)
-                  {
-                      for (int c = 0; c < 4; ++c)
-                      {
-                          int idx = r * 4 + c;
-                          std::wstring controlId = L"FilterMat_r" + std::to_wstring(r) + L"c" + std::to_wstring(c);
-                          std::wstring key = L"savedFilters[0].mat[" + std::to_wstring(idx) + L"]";
-                          logMatrixCell(controlId, key);
-                          verifyNumber(controlId.c_str(), key.c_str());
-                      }
-                  }
+                // Matrix (4x4)
+                for (int r = 0; r < 4; ++r)
+                {
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        int idx = r * 4 + c;
+                        std::wstring controlId = L"FilterMat_r" + std::to_wstring(r) + L"c" + std::to_wstring(c);
+                        std::wstring key = L"savedFilters[0].mat[" + std::to_wstring(idx) + L"]";
+                        logMatrixCell(controlId, key);
+                        verifyNumber(controlId.c_str(), key.c_str());
+                    }
+                }
 
-                  // Offset row (4)
-                  for (int c = 0; c < 4; ++c)
-                  {
-                      std::wstring controlId = L"FilterOffset_c" + std::to_wstring(c);
-                      std::wstring key = L"savedFilters[0].offset[" + std::to_wstring(c) + L"]";
-                      logMatrixCell(controlId, key);
-                      verifyNumber(controlId.c_str(), key.c_str());
-                  }
+                // Offset row (4)
+                for (int c = 0; c < 4; ++c)
+                {
+                    std::wstring controlId = L"FilterOffset_c" + std::to_wstring(c);
+                    std::wstring key = L"savedFilters[0].offset[" + std::to_wstring(c) + L"]";
+                    logMatrixCell(controlId, key);
+                    verifyNumber(controlId.c_str(), key.c_str());
+                }
+
+                // Verify selection color text boxes scoped to SelectionColorExpander
+                auto verifyNumberScoped = [&](const wchar_t* scopeId, const wchar_t* controlId, const wchar_t* key)
+                {
+                    std::wstring v = getField(key);
+                    if (v.empty()) return;
+                    double expected{};
+                    if (!JsonNumberLiteralToDouble(v, expected)) return;
+
+                    auto el = FindByAutomationIdScoped(win, scopeId, controlId);
+                    Assert::IsTrue(el != nullptr, (std::wstring(L"Missing number control (scoped): ") + controlId).c_str());
+
+                    CComPtr<IUIAutomationValuePattern> vpat;
+                    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&vpat))) && vpat)
+                    {
+                        CComBSTR val;
+                        vpat->get_CurrentValue(&val);
+                        std::wstring s(val);
+                        double actual{};
+                        if (JsonNumberLiteralToDouble(s, actual))
+                        {
+                            int ei = static_cast<int>(std::round(expected));
+                            int ai = static_cast<int>(std::round(actual));
+                            if (ei != ai)
+                            {
+                                std::wstring msg = L"[Test] Numeric mismatch (scoped) control=";
+                                msg += controlId;
+                                msg += L", key=";
+                                msg += key;
+                                msg += L", expectedInt=";
+                                msg += std::to_wstring(ei);
+                                msg += L", actualInt=";
+                                msg += std::to_wstring(ai);
+                                msg += L", expectedRaw=";
+                                msg += v;
+                                msg += L", actualRaw=";
+                                msg += s;
+                                LogMessage(msg);
+                                Assert::Fail((std::wstring(L"Numeric value mismatch on relaunch (scoped): ") + controlId).c_str());
+                            }
+                        }
+                    }
+                };
+
+                verifyNumberScoped(L"SelectionColorExpander", L"RedTextBox", L"selectionColor.r");
+                verifyNumberScoped(L"SelectionColorExpander", L"GreenTextBox", L"selectionColor.g");
+                verifyNumberScoped(L"SelectionColorExpander", L"BlueTextBox", L"selectionColor.b");
 
                 // Text / saved filter dropdown
                 // The saved filter name from JSON should appear as one of the items in SavedFiltersComboBox.
-                  auto verifyComboContainsItem = [&](const wchar_t* controlId, const wchar_t* key)
+                auto verifyComboContainsItem = [&](const wchar_t* controlId, const wchar_t* key)
                 {
                     std::wstring v = getField(key);
                     if (v.empty()) return;
