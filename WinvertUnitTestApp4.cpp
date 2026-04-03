@@ -15,9 +15,13 @@
 #include <sstream>
 #include <unordered_map>
 #include <cstdint>
+#include <vector>
+#include <mutex>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Management.Deployment.h>
 #pragma comment(lib, "windowsapp.lib")
 
 #include "CppUnitTest.h"
@@ -70,6 +74,25 @@ static std::wstring PFNForProcess(DWORD pid)
     return pfn;
 }
 
+static std::wstring FindInstalledWinvertPackageFamilyName()
+{
+    try
+    {
+        using namespace winrt::Windows::Management::Deployment;
+        PackageManager pm;
+        for (auto const& pkg : pm.FindPackagesForUser(L""))
+        {
+            auto id = pkg.Id();
+            if (id.Name() == L"Vibe.Winvert")
+            {
+                return id.FamilyName().c_str();
+            }
+        }
+    }
+    catch (...) {}
+    return L"";
+}
+
 static DWORD LaunchWinvert4(std::wstring& outPfn)
 {
     CComPtr<IApplicationActivationManager> aam;
@@ -77,11 +100,24 @@ static DWORD LaunchWinvert4(std::wstring& outPfn)
                                   CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&aam));
     if (FAILED(hr)) return 0;
 
-    constexpr wchar_t kWinvert4Aumid[] =
-        L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90_ft4zefc91v2gy!App";
-
     DWORD pid = 0;
-    hr = aam->ActivateApplication(kWinvert4Aumid, nullptr, AO_NONE, &pid);
+    // Prefer current package identity, then fall back to legacy AUMID.
+    std::wstring pfn = FindInstalledWinvertPackageFamilyName();
+    if (!pfn.empty())
+    {
+        std::wstring aumid = pfn + L"!App";
+        hr = aam->ActivateApplication(aumid.c_str(), nullptr, AO_NONE, &pid);
+        if (SUCCEEDED(hr) && pid != 0)
+        {
+            outPfn = PFNForProcess(pid);
+            if (outPfn.empty()) outPfn = pfn;
+            return pid;
+        }
+    }
+
+    constexpr wchar_t kLegacyWinvertAumid[] =
+        L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90_ft4zefc91v2gy!App";
+    hr = aam->ActivateApplication(kLegacyWinvertAumid, nullptr, AO_NONE, &pid);
     if (FAILED(hr) || pid == 0) return 0;
 
     outPfn = PFNForProcess(pid);
@@ -397,6 +433,32 @@ static void EnsureProcessExited(DWORD pid, int timeoutMs = 5000)
     CloseHandle(h);
 }
 
+static std::mutex g_launchedPidsMutex;
+static std::vector<DWORD> g_launchedPids;
+
+static void TrackLaunchedPid(DWORD pid)
+{
+    if (pid == 0) return;
+    std::lock_guard<std::mutex> lock(g_launchedPidsMutex);
+    if (std::find(g_launchedPids.begin(), g_launchedPids.end(), pid) == g_launchedPids.end())
+    {
+        g_launchedPids.push_back(pid);
+    }
+}
+
+static void CleanupTrackedWinvertProcesses()
+{
+    std::vector<DWORD> pids;
+    {
+        std::lock_guard<std::mutex> lock(g_launchedPidsMutex);
+        pids.swap(g_launchedPids);
+    }
+    for (DWORD pid : pids)
+    {
+        EnsureProcessExited(pid, 2000);
+    }
+}
+
 static void DumpAllAutomationElements(IUIAutomationElement* root)
 {
     if (!root) return;
@@ -449,6 +511,7 @@ static void ExpandAllSettingsExpanders(IUIAutomationElement* root)
     {
         L"SelectionColorExpander",
         L"BrightnessExpander",
+        L"StartupBehaviorExpander",
         L"HotkeysExpander",
         L"CustomFiltersExpander",
         L"ColorMappingExpander"
@@ -692,12 +755,18 @@ static bool CompareFilesAndLog(const std::wstring& expectedPath, const std::wstr
 struct AppCloser
 {
     CComPtr<IUIAutomationElement> win;
+    DWORD pid{ 0 };
     bool closed{ false };
     ~AppCloser()
     {
         if (win && !closed)
         {
             CloseWindow(win);
+        }
+        if (pid != 0)
+        {
+            EnsureProcessExited(pid, 2000);
+            pid = 0;
         }
     }
 };
@@ -707,6 +776,11 @@ namespace WinvertUnitTestApp4
     TEST_CLASS(EndToEndTests)
     {
     public:
+        TEST_METHOD_CLEANUP(Cleanup)
+        {
+            CleanupTrackedWinvertProcesses();
+        }
+
         TEST_METHOD(Winvert_Launch)
         {
             LogMessage(L"[Test] Running Winvert_Launch");
@@ -715,6 +789,8 @@ namespace WinvertUnitTestApp4
 
             std::wstring pfn; DWORD pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
 
             LogMessage(L"[Test] Winvert_Launch: waiting for main window");
             CComPtr<IUIAutomationElement> win;
@@ -757,7 +833,7 @@ namespace WinvertUnitTestApp4
             AppCloser closer;
 
             // 1) Ensure no save file to start (compute path from known package family)
-            std::wstring packageFamily = L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90_ft4zefc91v2gy";
+            std::wstring packageFamily = FindInstalledWinvertPackageFamilyName();
             std::wstring localState = LocalStatePathForPFN(packageFamily);
             Assert::IsTrue(!localState.empty(), L"Failed to get LocalState path");
             std::wstring settingsPath = localState + L"\\settings.json";
@@ -767,6 +843,8 @@ namespace WinvertUnitTestApp4
             // 2) Launch app with no save file (defaults)
             std::wstring pfn; DWORD pid = LaunchWinvert4(pfn);
             Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
 
             LogMessage(L"[Test] Waiting for app to finish startup");
             SleepMs(3000);
@@ -805,9 +883,11 @@ namespace WinvertUnitTestApp4
                 { L"LumaRNumberBox",          L"R",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
                 { L"LumaGNumberBox",          L"G",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
                 { L"LumaBNumberBox",          L"B",                         L"Microsoft.UI.Xaml.Controls.NumberBox" },
+                { L"StartupBehaviorExpander", nullptr,                      L"Microsoft.UI.Xaml.Controls.Expander" },
+                { L"RunAtStartupToggle",      nullptr,                      L"ToggleSwitch" },
+                { L"OpenUiOnStartupToggle",   nullptr,                      L"ToggleSwitch" },
                 { L"ShowFpsToggle",           nullptr,                      L"ToggleSwitch" },
                 { L"HotkeysExpander",         nullptr,                      L"Microsoft.UI.Xaml.Controls.Expander" },
-                { L"RunAtStartupToggle",      nullptr,                      L"ToggleSwitch" },
                 { L"InvertHotkeyTextBox",     nullptr,                      L"TextBox" },
                 { L"RebindInvertHotkeyButton",L"Rebind Invert/Add",         L"Button" },
                 { L"FilterHotkeyTextBox",     nullptr,                      L"TextBox" },
@@ -894,7 +974,7 @@ namespace WinvertUnitTestApp4
             AppCloser closer;
 
             // Paths
-            std::wstring packageFamily = L"b27d31cf-c66d-45ac-aad0-e0d9501a1c90_ft4zefc91v2gy";
+            std::wstring packageFamily = FindInstalledWinvertPackageFamilyName();
             std::wstring localState = LocalStatePathForPFN(packageFamily);
             Assert::IsTrue(!localState.empty(), L"Failed to get LocalState path");
             std::wstring settingsPath = localState + L"\\settings.json";
@@ -925,6 +1005,8 @@ namespace WinvertUnitTestApp4
                 std::wstring pfn;
                 DWORD pid = LaunchWinvert4(pfn);
                 Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+                TrackLaunchedPid(pid);
+                closer.pid = pid;
 
                 CComPtr<IUIAutomationElement> win;
                 for (int i = 0; i < 300 && !win; ++i)
@@ -1098,11 +1180,9 @@ namespace WinvertUnitTestApp4
                 // 4) Show FPS toggle
                 setToggleFromField(L"ShowFpsToggle", L"toggles.showFps");
 
-                // 5) Run at startup toggle (no JSON field yet; just exercise it if present)
-                if (auto runStartup = WaitForAutomationId(win, L"RunAtStartupToggle"))
-                {
-                    Toggle(runStartup, ToggleState_On);
-                }
+                // 5) Startup behavior toggles
+                setToggleFromField(L"OpenUiOnStartupToggle", L"toggles.openUiOnStartup");
+                if (auto runStartup = WaitForAutomationId(win, L"RunAtStartupToggle")) Toggle(runStartup, ToggleState_On);
 
                 // 6) Custom Filters: set name and save
                 setComboTextFromField(L"SavedFiltersComboBox", L"savedFilters[0].name");
@@ -1136,6 +1216,7 @@ namespace WinvertUnitTestApp4
                 const wchar_t* keysToCheck[] =
                 {
                     L"toggles.showFps",
+                    L"toggles.openUiOnStartup",
                     L"toggles.selectionColorEnabled",
                     L"toggles.colorMapPreserve",
                     L"selectionColor.r",
@@ -1255,6 +1336,8 @@ namespace WinvertUnitTestApp4
                 pfn.clear();
                 pid = LaunchWinvert4(pfn);
                 Assert::IsTrue(pid != 0, L"Failed to relaunch Winvert4");
+                TrackLaunchedPid(pid);
+                closer.pid = pid;
 
                 win.Release();
                 for (int i = 0; i < 300 && !win; ++i)
@@ -1391,6 +1474,7 @@ namespace WinvertUnitTestApp4
 
                 // Toggles
                 verifyToggle(L"ShowFpsToggle", L"toggles.showFps");
+                verifyToggle(L"OpenUiOnStartupToggle", L"toggles.openUiOnStartup");
                 verifyToggle(L"SelectionColorEnableToggle", L"toggles.selectionColorEnabled");
                 //verifyToggle(L"ColorMapPreserveToggle", L"toggles.colorMapPreserve");
 
