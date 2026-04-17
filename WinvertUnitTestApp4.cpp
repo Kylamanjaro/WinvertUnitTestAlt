@@ -83,7 +83,8 @@ static std::wstring FindInstalledWinvertPackageFamilyName()
         for (auto const& pkg : pm.FindPackagesForUser(L""))
         {
             auto id = pkg.Id();
-            if (id.Name() == L"Vibe.Winvert")
+            auto name = id.Name();
+            if (name == L"Vibe.Winvert" || name == L"CodeMaxx.Winvert")
             {
                 return id.FamilyName().c_str();
             }
@@ -1182,7 +1183,7 @@ namespace WinvertUnitTestApp4
 
                 // 5) Startup behavior toggles
                 setToggleFromField(L"OpenUiOnStartupToggle", L"toggles.openUiOnStartup");
-                if (auto runStartup = WaitForAutomationId(win, L"RunAtStartupToggle")) Toggle(runStartup, ToggleState_On);
+                setToggleFromField(L"RunAtStartupToggle", L"toggles.runAtStartup");
 
                 // 6) Custom Filters: set name and save
                 setComboTextFromField(L"SavedFiltersComboBox", L"savedFilters[0].name");
@@ -1217,6 +1218,7 @@ namespace WinvertUnitTestApp4
                 {
                     L"toggles.showFps",
                     L"toggles.openUiOnStartup",
+                    L"toggles.runAtStartup",
                     L"toggles.selectionColorEnabled",
                     L"toggles.colorMapPreserve",
                     L"selectionColor.r",
@@ -1475,6 +1477,7 @@ namespace WinvertUnitTestApp4
                 // Toggles
                 verifyToggle(L"ShowFpsToggle", L"toggles.showFps");
                 verifyToggle(L"OpenUiOnStartupToggle", L"toggles.openUiOnStartup");
+                verifyToggle(L"RunAtStartupToggle", L"toggles.runAtStartup");
                 verifyToggle(L"SelectionColorEnableToggle", L"toggles.selectionColorEnabled");
                 //verifyToggle(L"ColorMapPreserveToggle", L"toggles.colorMapPreserve");
 
