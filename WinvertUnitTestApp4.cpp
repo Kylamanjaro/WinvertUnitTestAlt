@@ -94,6 +94,14 @@ static std::wstring FindInstalledWinvertPackageFamilyName()
     return L"";
 }
 
+static std::wstring InstalledSettingsPath()
+{
+    std::wstring packageFamily = FindInstalledWinvertPackageFamilyName();
+    std::wstring localState = LocalStatePathForPFN(packageFamily);
+    if (localState.empty()) return L"";
+    return localState + L"\\settings.json";
+}
+
 static DWORD LaunchWinvert4(std::wstring& outPfn)
 {
     CComPtr<IApplicationActivationManager> aam;
@@ -337,6 +345,47 @@ static bool ClickAtScreenPoint(LONG x, LONG y)
     return SendInput(2, inputs, sizeof(INPUT)) == 2;
 }
 
+static bool SendVirtualKeyTap(WORD vk)
+{
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = vk;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = vk;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(2, inputs, sizeof(INPUT)) == 2;
+}
+
+static bool SendCtrlAltChord(WORD vk)
+{
+    INPUT inputs[6]{};
+
+    // Ctrl down
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    // Alt down
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_MENU;
+    // Key down
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = vk;
+    // Key up
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = vk;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    // Alt up
+    inputs[4].type = INPUT_KEYBOARD;
+    inputs[4].ki.wVk = VK_MENU;
+    inputs[4].ki.dwFlags = KEYEVENTF_KEYUP;
+    // Ctrl up
+    inputs[5].type = INPUT_KEYBOARD;
+    inputs[5].ki.wVk = VK_CONTROL;
+    inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    return SendInput(6, inputs, sizeof(INPUT)) == 6;
+}
+
+
 static bool InvokeElement(IUIAutomationElement* el)
 {
     if (!el) return false;
@@ -400,6 +449,62 @@ static bool SetValue(IUIAutomationElement* el, const wchar_t* value)
     if (FAILED(inner->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&pat))) || !pat) return false;
     CComBSTR b(value);
     return SUCCEEDED(pat->SetValue(b));
+}
+
+static int CountTabItems(IUIAutomationElement* root, const wchar_t* tabAutomationId)
+{
+    if (!root || !tabAutomationId) return 0;
+
+    auto tabRoot = FindByAutomationId(root, tabAutomationId);
+    if (!tabRoot) return 0;
+
+    CComPtr<IUIAutomation> uia;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
+        return 0;
+
+    CComVariant vType;
+    vType.vt = VT_I4;
+    vType.lVal = UIA_TabItemControlTypeId;
+
+    CComPtr<IUIAutomationCondition> tabItemCond;
+    if (FAILED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, vType, &tabItemCond)) || !tabItemCond)
+        return 0;
+
+    CComPtr<IUIAutomationElementArray> arr;
+    if (FAILED(tabRoot->FindAll(TreeScope_Subtree, tabItemCond, &arr)) || !arr)
+        return 0;
+
+    int length = 0;
+    arr->get_Length(&length);
+    return length;
+}
+
+static std::wstring GetValue(IUIAutomationElement* el)
+{
+    if (!el) return L"";
+
+    CComPtr<IUIAutomationValuePattern> pat;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&pat))) && pat)
+    {
+        CComBSTR value;
+        if (SUCCEEDED(pat->get_CurrentValue(&value)) && value)
+        {
+            return std::wstring(value, value.Length());
+        }
+    }
+
+    auto inner = FindByAutomationId(el, L"InputBox");
+    if (!inner) return L"";
+
+    pat.Release();
+    if (FAILED(inner->GetCurrentPatternAs(UIA_ValuePatternId, IID_PPV_ARGS(&pat))) || !pat) return L"";
+    CComBSTR value;
+    if (SUCCEEDED(pat->get_CurrentValue(&value)) && value)
+    {
+        return std::wstring(value, value.Length());
+    }
+
+    return L"";
 }
 
 static bool CloseWindow(IUIAutomationElement* win)
@@ -1807,6 +1912,247 @@ namespace WinvertUnitTestApp4
                 fs::path golden2 = reposRoot / L"WinvertUnitTestApp4" / L"saves" / L"settings2.json";
                 runScenario(L"settings2.json", golden2.wstring());
             }
+        }
+
+        TEST_METHOD(Hotkey_Defaults)
+        {
+            LogMessage(L"[Test] Running Hotkey_Defaults");
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            AppCloser closer;
+
+            std::wstring pfn;
+            DWORD pid = LaunchWinvert4(pfn);
+            Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
+
+            CComPtr<IUIAutomationElement> win;
+            for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
+            Assert::IsTrue(win != nullptr, L"Main window not found");
+            closer.win = win;
+
+            auto settingsBtn = WaitForAutomationId(win, L"SettingsButton");
+            Assert::IsTrue(settingsBtn != nullptr, L"SettingsButton not found");
+            Assert::IsTrue(InvokeElement(settingsBtn), L"Failed to click SettingsButton");
+            SleepMs(750);
+
+            ExpandAllSettingsExpanders(win);
+
+            auto invertBox = WaitForAutomationId(win, L"InvertHotkeyTextBox");
+            auto filterBox = WaitForAutomationId(win, L"FilterHotkeyTextBox");
+            auto removeBox = WaitForAutomationId(win, L"RemoveHotkeyTextBox");
+            Assert::IsTrue(invertBox != nullptr, L"InvertHotkeyTextBox not found");
+            Assert::IsTrue(filterBox != nullptr, L"FilterHotkeyTextBox not found");
+            Assert::IsTrue(removeBox != nullptr, L"RemoveHotkeyTextBox not found");
+
+            const std::wstring invertText = GetValue(invertBox);
+            const std::wstring filterText = GetValue(filterBox);
+            const std::wstring removeText = GetValue(removeBox);
+
+            LogMessage(L"[Test] Hotkey defaults: invert=\"" + invertText + L"\" filter=\"" + filterText + L"\" remove=\"" + removeText + L"\"");
+
+            Assert::IsTrue(invertText == L"Ctrl + Alt + I", L"Unexpected default invert hotkey");
+            Assert::IsTrue(filterText == L"Ctrl + Alt + F", L"Unexpected default filter hotkey");
+            Assert::IsTrue(removeText == L"Ctrl + Alt + D", L"Unexpected default remove hotkey");
+
+            CloseWindow(win);
+            closer.closed = true;
+        }
+
+        TEST_METHOD(Hotkey_Capture_PrimaryMonitor)
+        {
+            LogMessage(L"[Test] Running Hotkey_Capture_PrimaryMonitor");
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            AppCloser closer;
+
+            // Force default bindings for deterministic hotkey behavior.
+            if (auto settingsPath = InstalledSettingsPath(); !settingsPath.empty() && fs::exists(settingsPath))
+            {
+                fs::remove(settingsPath);
+            }
+
+            std::wstring pfn;
+            DWORD pid = LaunchWinvert4(pfn);
+            Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
+
+            CComPtr<IUIAutomationElement> win;
+            for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
+            Assert::IsTrue(win != nullptr, L"Main window not found");
+            closer.win = win;
+
+            EnsureWindowVisible(win);
+            SleepMs(300);
+
+            const int beforeTabs = CountTabItems(win, L"RegionsTabView");
+            LogMessage(L"[Test] RegionsTabView tab count before hotkey=" + std::to_wstring(beforeTabs));
+
+            // Start invert/add capture with default hotkey Ctrl+Alt+I
+            Assert::IsTrue(SendCtrlAltChord('I'), L"Failed to send Ctrl+Alt+I");
+            SleepMs(500);
+
+            // Select primary monitor via numeric key "1"
+            Assert::IsTrue(SendVirtualKeyTap('1'), L"Failed to send key 1");
+
+            bool added = false;
+            int afterTabs = beforeTabs;
+            for (int i = 0; i < 80; ++i)
+            {
+                SleepMs(100);
+                afterTabs = CountTabItems(win, L"RegionsTabView");
+                if (afterTabs > beforeTabs)
+                {
+                    added = true;
+                    break;
+                }
+            }
+
+            LogMessage(L"[Test] RegionsTabView tab count after hotkey=" + std::to_wstring(afterTabs));
+            Assert::IsTrue(added, L"Ctrl+Alt+I then 1 did not create a new region tab");
+
+            CloseWindow(win);
+            closer.closed = true;
+        }
+
+        TEST_METHOD(Hotkey_Filter_PrimaryMonitor)
+        {
+            LogMessage(L"[Test] Running Hotkey_Filter_PrimaryMonitor");
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            AppCloser closer;
+
+            // Force default bindings for deterministic hotkey behavior.
+            if (auto settingsPath = InstalledSettingsPath(); !settingsPath.empty() && fs::exists(settingsPath))
+            {
+                fs::remove(settingsPath);
+            }
+
+            std::wstring pfn;
+            DWORD pid = LaunchWinvert4(pfn);
+            Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
+
+            CComPtr<IUIAutomationElement> win;
+            for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
+            Assert::IsTrue(win != nullptr, L"Main window not found");
+            closer.win = win;
+
+            EnsureWindowVisible(win);
+            SleepMs(300);
+
+            const int beforeTabs = CountTabItems(win, L"RegionsTabView");
+            LogMessage(L"[Test] RegionsTabView tab count before filter hotkey=" + std::to_wstring(beforeTabs));
+
+            // Start filter/add capture with default hotkey Ctrl+Alt+F
+            Assert::IsTrue(SendCtrlAltChord('F'), L"Failed to send Ctrl+Alt+F");
+            SleepMs(500);
+
+            // Select primary monitor via numeric key "1"
+            Assert::IsTrue(SendVirtualKeyTap('1'), L"Failed to send key 1");
+
+            bool added = false;
+            int afterTabs = beforeTabs;
+            for (int i = 0; i < 80; ++i)
+            {
+                SleepMs(100);
+                afterTabs = CountTabItems(win, L"RegionsTabView");
+                if (afterTabs > beforeTabs)
+                {
+                    added = true;
+                    break;
+                }
+            }
+
+            LogMessage(L"[Test] RegionsTabView tab count after filter hotkey=" + std::to_wstring(afterTabs));
+            Assert::IsTrue(added, L"Ctrl+Alt+F then 1 did not create a new region tab");
+
+            CloseWindow(win);
+            closer.closed = true;
+        }
+
+        TEST_METHOD(Hotkey_RemoveLastWindowOnly)
+        {
+            LogMessage(L"[Test] Running Hotkey_RemoveLastWindowOnly");
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            AppCloser closer;
+
+            // Force default bindings for deterministic hotkey behavior.
+            if (auto settingsPath = InstalledSettingsPath(); !settingsPath.empty() && fs::exists(settingsPath))
+            {
+                fs::remove(settingsPath);
+            }
+
+            std::wstring pfn;
+            DWORD pid = LaunchWinvert4(pfn);
+            Assert::IsTrue(pid != 0, L"Failed to launch Winvert4");
+            TrackLaunchedPid(pid);
+            closer.pid = pid;
+
+            CComPtr<IUIAutomationElement> win;
+            for (int i = 0; i < 300 && !win; ++i) { SleepMs(100); win = FindMainWindowForPid(pid); }
+            Assert::IsTrue(win != nullptr, L"Main window not found");
+            closer.win = win;
+
+            EnsureWindowVisible(win);
+            SleepMs(300);
+
+            const int beforeTabs = CountTabItems(win, L"RegionsTabView");
+            LogMessage(L"[Test] Region tabs before create=" + std::to_wstring(beforeTabs));
+
+            // Create two regions on primary monitor using real key input:
+            // Ctrl+Alt+I, then 1; repeat once.
+            auto createRegionOnPrimary = [&](int expectedTabsAfterCreate, const wchar_t* failureLabel)
+            {
+                Assert::IsTrue(SendCtrlAltChord('I'), L"Failed to send Ctrl+Alt+I");
+                SleepMs(500);
+                Assert::IsTrue(SendVirtualKeyTap('1'), L"Failed to send key 1");
+
+                bool created = false;
+                for (int i = 0; i < 80; ++i)
+                {
+                    SleepMs(100);
+                    const int tabs = CountTabItems(win, L"RegionsTabView");
+                    if (tabs >= expectedTabsAfterCreate)
+                    {
+                        created = true;
+                        break;
+                    }
+                }
+                Assert::IsTrue(created, failureLabel);
+            };
+
+            createRegionOnPrimary(beforeTabs + 1, L"Failed to create first region with Ctrl+Alt+I then 1");
+            createRegionOnPrimary(beforeTabs + 2, L"Failed to create second region with Ctrl+Alt+I then 1");
+
+            int afterCreateTabs = CountTabItems(win, L"RegionsTabView");
+            LogMessage(L"[Test] Region tabs after two creates=" + std::to_wstring(afterCreateTabs));
+            Assert::IsTrue(afterCreateTabs >= beforeTabs + 2, L"Expected at least two created regions before remove");
+
+            // Remove last region only using real key input: Ctrl+Alt+D (default remove hotkey)
+            Assert::IsTrue(SendCtrlAltChord('D'), L"Failed to send Ctrl+Alt+D");
+
+            bool removed = false;
+            int afterRemoveTabs = afterCreateTabs;
+            for (int i = 0; i < 20; ++i)
+            {
+                SleepMs(100);
+                afterRemoveTabs = CountTabItems(win, L"RegionsTabView");
+                if (afterRemoveTabs == beforeTabs + 1)
+                {
+                    removed = true;
+                    break;
+                }
+            }
+
+            LogMessage(L"[Test] Region tabs after remove=" + std::to_wstring(afterRemoveTabs));
+            Assert::IsTrue(removed, L"Remove hotkey did not remove only the last region");
+
+            // App/control panel should remain alive.
+            Assert::IsTrue(FindMainWindowForPid(pid) != nullptr, L"Main window unexpectedly closed after remove hotkey");
+
+            CloseWindow(win);
+            closer.closed = true;
         }
     };
 }
