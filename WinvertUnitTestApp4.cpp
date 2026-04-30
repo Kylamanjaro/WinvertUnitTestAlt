@@ -84,7 +84,7 @@ static std::wstring FindInstalledWinvertPackageFamilyName()
         {
             auto id = pkg.Id();
             auto name = id.Name();
-            if (name == L"Vibe.Winvert" || name == L"CodeMaxx.Winvert")
+            if (name == L"Vibe.Winvert" || name == L"CodeMaxx.Winvert" || name == L"Vibe.54945B4883422")
             {
                 return id.FamilyName().c_str();
             }
